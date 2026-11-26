@@ -22,6 +22,7 @@ if False:  # pragma: no cover
     import onnxruntime  # noqa: F401
     import pyaudiowpatch  # noqa: F401
     import rapidocr  # noqa: F401
+    import sherpa_onnx  # noqa: F401
 
 from PySide6.QtCore import Qt
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
@@ -46,7 +47,7 @@ def main() -> int:
 
     app = QApplication(sys.argv)
     app.setApplicationName("轻译")
-    app.setQuitOnLastWindowClosed(True)
+    app.setQuitOnLastWindowClosed(False)
 
     # Single-instance check: if already running, wake up existing Control Panel immediately!
     probe = QLocalSocket()

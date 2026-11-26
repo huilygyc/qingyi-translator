@@ -93,6 +93,7 @@ class FloatingTranslatorService : Service() {
     private var virtualDisplay: VirtualDisplay? = null
     private var imageReader: ImageReader? = null
     private var screenLoopJob: Job? = null
+    private var autoHideJob: Job? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -169,7 +170,7 @@ class FloatingTranslatorService : Service() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val chan = NotificationChannel(
                 NOTIF_CHANNEL_ID,
-                "番译姬全局悬浮歌词服务",
+                "轻译悬浮字幕服务",
                 NotificationManager.IMPORTANCE_LOW
             )
             val nm = getSystemService(NotificationManager::class.java)
@@ -198,8 +199,8 @@ class FloatingTranslatorService : Service() {
         }
         return builder
             .setSmallIcon(android.R.drawable.ic_menu_sort_alphabetically)
-            .setContentTitle("番译姬 AniLingo 正在运行")
-            .setContentText("点击返回主控台 · 若开启穿透锁定可点下方解锁")
+            .setContentTitle("轻译 正在运行")
+            .setContentText("点击返回控制面板 · 若开启穿透锁定可点下方解锁")
             .setContentIntent(openIntent)
             .addAction(
                 Notification.Action.Builder(null, "解锁悬浮窗穿透", unlockIntent).build()
@@ -213,7 +214,7 @@ class FloatingTranslatorService : Service() {
 
     private fun setupFloatingLyricsOverlay() {
         if (!Settings.canDrawOverlays(this)) {
-            AppStateBus.setStatus("⚠️ 请先授予全局悬浮窗权限")
+            AppStateBus.setStatus("请先授予全局悬浮窗权限")
             stopSelf()
             return
         }
@@ -223,14 +224,13 @@ class FloatingTranslatorService : Service() {
             gravity = Gravity.CENTER_HORIZONTAL
         }
 
-        // Hover/Tap Mini Action Capsule (NetEase Cloud Music mobile floating lyrics style)
         val barScroll = HorizontalScrollView(this).apply {
             isHorizontalScrollBarEnabled = false
             visibility = View.GONE
             background = GradientDrawable().apply {
-                setColor(Color.argb(226, 18, 22, 36))
+                setColor(Color.argb(242, 255, 255, 255))
                 cornerRadius = dp(16f).toFloat()
-                setStroke(dp(1f), Color.argb(95, 255, 180, 220))
+                setStroke(dp(1f), Color.parseColor("#CBD5E1"))
             }
             setPadding(dp(8f), dp(3f), dp(8f), dp(3f))
         }
@@ -243,26 +243,26 @@ class FloatingTranslatorService : Service() {
         fun makeActionChip(label: String, onClick: () -> Unit): TextView {
             return TextView(this).apply {
                 text = label
-                setTextColor(Color.parseColor("#F5F7FF"))
-                textSize = 11.5f
-                setPadding(dp(7f), dp(4f), dp(7f), dp(4f))
+                setTextColor(Color.parseColor("#1E293B"))
+                textSize = 12f
+                setPadding(dp(8f), dp(5f), dp(8f), dp(5f))
                 setOnClickListener { onClick() }
             }
         }
 
-        barRow.addView(makeActionChip("🖱️框选区") { showRegionPicker("mark_region") })
-        barRow.addView(makeActionChip("📺盯屏") { toggleLiveScreen() })
-        barRow.addView(makeActionChip("✂️截屏译") {
+        barRow.addView(makeActionChip("框选") { showRegionPicker("mark_region") })
+        barRow.addView(makeActionChip("盯屏") { toggleLiveScreen() })
+        barRow.addView(makeActionChip("截屏") {
             if (mediaProjection == null) requestProjectionViaActivity("snip") else showRegionPicker("snip")
         })
-        barRow.addView(makeActionChip("🎙️听译") { toggleAudio() })
-        barRow.addView(makeActionChip("🎨换肤") {
+        barRow.addView(makeActionChip("听译") { toggleAudio() })
+        barRow.addView(makeActionChip("主题") {
             val preset = AppStateBus.cycleNextPreset(this)
-            Toast.makeText(this, "已切换：${preset.title}", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "主题：${preset.title}", Toast.LENGTH_SHORT).show()
         })
-        barRow.addView(makeActionChip("✏️改词") { showFloatingEditDialog() })
-        barRow.addView(makeActionChip("🔒穿透") { setClickThroughLock(true) })
-        barRow.addView(makeActionChip("✕") { stopSelf() })
+        barRow.addView(makeActionChip("改词") { showFloatingEditDialog() })
+        barRow.addView(makeActionChip("穿透") { setClickThroughLock(true) })
+        barRow.addView(makeActionChip("关闭") { stopSelf() })
         barScroll.addView(barRow)
 
         val lView = LyricsCanvasView(this).apply {
@@ -355,6 +355,17 @@ class FloatingTranslatorService : Service() {
         serviceScope.launch {
             AppStateBus.currentTranslated.collectLatest { trans ->
                 lyricsView?.translatedText = trans
+                lyricsView?.alpha = 1f
+                autoHideJob?.cancel()
+                val sec = AppStateBus.style.value.autoHideSeconds
+                if (sec > 0 && trans.isNotBlank()) {
+                    autoHideJob = serviceScope.launch {
+                        delay(sec * 1000L)
+                        if (toolbarScroll?.visibility != View.VISIBLE) {
+                            lyricsView?.alpha = 0f
+                        }
+                    }
+                }
             }
         }
         serviceScope.launch {
@@ -376,26 +387,27 @@ class FloatingTranslatorService : Service() {
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
             runCatching { windowManager.updateViewLayout(container, params) }
             showEdgeUnlockBadge()
-            Toast.makeText(this, "🔒 已开启穿透锁定 · 点击右侧边缘「🔓译」小标即可解锁", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "已开启穿透锁定，点击右侧「解锁」按钮即可恢复", Toast.LENGTH_SHORT).show()
         } else {
             params.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
             runCatching { windowManager.updateViewLayout(container, params) }
             removeEdgeUnlockBadge()
-            Toast.makeText(this, "🔓 悬浮字幕已解锁", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "悬浮字幕已解锁", Toast.LENGTH_SHORT).show()
         }
     }
 
     private fun showEdgeUnlockBadge() {
         if (unlockBadgeView != null) return
         val badge = TextView(this).apply {
-            text = "🔓译"
-            textSize = 11f
-            setTextColor(Color.WHITE)
-            setPadding(dp(8f), dp(6f), dp(8f), dp(6f))
+            text = "解锁"
+            textSize = 11.5f
+            setTextColor(Color.parseColor("#2563EB"))
+            setPadding(dp(10f), dp(6f), dp(10f), dp(6f))
             background = GradientDrawable().apply {
-                setColor(Color.argb(185, 224, 82, 151))
+                setColor(Color.argb(235, 255, 255, 255))
                 cornerRadius = dp(14f).toFloat()
+                setStroke(dp(1f), Color.parseColor("#93C5FD"))
             }
             setOnClickListener { setClickThroughLock(false) }
         }
@@ -529,7 +541,7 @@ class FloatingTranslatorService : Service() {
         ocrEngine.resetDedup()
         ensureVirtualDisplay()
         AppStateBus.setLiveScreenActive(true)
-        AppStateBus.setStatus("📺 正在实时监控手机屏幕字幕区...")
+        AppStateBus.setStatus("正在实时监控屏幕字幕区域")
         toolbarScroll?.visibility = View.GONE
 
         screenLoopJob = serviceScope.launch {
@@ -558,7 +570,7 @@ class FloatingTranslatorService : Service() {
         screenLoopJob?.cancel()
         screenLoopJob = null
         AppStateBus.setLiveScreenActive(false)
-        AppStateBus.setStatus("⏸️ 已停止手机屏幕实时盯屏")
+        AppStateBus.setStatus("已停止屏幕实时盯屏")
     }
 
     private fun showRegionPicker(mode: String) {
@@ -571,7 +583,7 @@ class FloatingTranslatorService : Service() {
                 removeRegionPicker()
                 if (mode == "mark_region") {
                     AppStateBus.updateCaptureRegion(this, normRect)
-                    Toast.makeText(this, "✅ 已保存实时字幕区域", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this, "已保存实时字幕区域", Toast.LENGTH_SHORT).show()
                     if (mediaProjection != null && !AppStateBus.liveScreenActive.value) {
                         startLiveScreenLoop()
                     }
@@ -632,7 +644,7 @@ class FloatingTranslatorService : Service() {
         if (AppStateBus.liveAudioActive.value) {
             audioEngine.stopAll()
             AppStateBus.setLiveAudioActive(false)
-            AppStateBus.setStatus("⏹️ 已停止声音实时听译")
+            AppStateBus.setStatus("已停止声音实时听译")
         } else {
             val mode = AppStateBus.engineConfig.value.audioSource
             if (mode == "internal") {
@@ -662,40 +674,40 @@ class FloatingTranslatorService : Service() {
 
         val card = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(16f), dp(14f), dp(16f), dp(14f))
+            setPadding(dp(18f), dp(16f), dp(18f), dp(16f))
             background = GradientDrawable().apply {
-                setColor(Color.argb(244, 20, 24, 38))
-                cornerRadius = dp(18f).toFloat()
-                setStroke(dp(1.2f), Color.parseColor("#FF85C0"))
+                setColor(Color.WHITE)
+                cornerRadius = dp(16f).toFloat()
+                setStroke(dp(1f), Color.parseColor("#CBD5E1"))
             }
         }
 
         val title = TextView(this).apply {
-            text = "✏️ 修改当前字幕 & 记住番剧人名"
-            textSize = 14.5f
-            setTextColor(Color.parseColor("#FFD4E8"))
+            text = "修改当前字幕"
+            textSize = 15f
+            setTextColor(Color.parseColor("#0F172A"))
         }
         card.addView(title)
 
         val transInput = EditText(this).apply {
             setText(AppStateBus.currentTranslated.value)
-            setTextColor(Color.WHITE)
+            setTextColor(Color.parseColor("#0F172A"))
             hint = "修改中文译文"
-            setHintTextColor(Color.GRAY)
+            setHintTextColor(Color.parseColor("#94A3B8"))
         }
         card.addView(transInput)
 
         val glossRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         val srcInput = EditText(this).apply {
-            hint = "原词(如フリーレン)"
-            setTextColor(Color.WHITE)
-            setHintTextColor(Color.GRAY)
+            hint = "外语原词"
+            setTextColor(Color.parseColor("#0F172A"))
+            setHintTextColor(Color.parseColor("#94A3B8"))
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
         val dstInput = EditText(this).apply {
-            hint = "译名(如芙莉莲)"
-            setTextColor(Color.WHITE)
-            setHintTextColor(Color.GRAY)
+            hint = "固定译名"
+            setTextColor(Color.parseColor("#0F172A"))
+            setHintTextColor(Color.parseColor("#94A3B8"))
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
         glossRow.addView(srcInput)
@@ -707,18 +719,18 @@ class FloatingTranslatorService : Service() {
             gravity = Gravity.END
         }
         val btnCancel = TextView(this).apply {
-            text = "关闭"
-            setTextColor(Color.LTGRAY)
-            setPadding(dp(12f), dp(8f), dp(12f), dp(8f))
+            text = "取消"
+            setTextColor(Color.parseColor("#64748B"))
+            setPadding(dp(14f), dp(8f), dp(14f), dp(8f))
             setOnClickListener { closeFloatingEditDialog() }
         }
         val btnSave = TextView(this).apply {
-            text = "✅ 保存修改"
+            text = "保存修改"
             setTextColor(Color.WHITE)
-            setPadding(dp(14f), dp(8f), dp(14f), dp(8f))
+            setPadding(dp(16f), dp(8f), dp(16f), dp(8f))
             background = GradientDrawable().apply {
-                setColor(Color.parseColor("#E05297"))
-                cornerRadius = dp(10f).toFloat()
+                setColor(Color.parseColor("#2563EB"))
+                cornerRadius = dp(9f).toFloat()
             }
             setOnClickListener {
                 val gs = srcInput.text.toString().trim()

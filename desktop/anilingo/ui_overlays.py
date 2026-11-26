@@ -476,6 +476,7 @@ class LyricsSubtitleWindow(QWidget):
         self._toast_text = ""
 
         self._hovered = False
+        self._auto_hidden = False
         self._dragging = False
         self._resizing = False
         self._drag_offset = QPoint()
@@ -501,6 +502,10 @@ class LyricsSubtitleWindow(QWidget):
         self._toast_timer = QTimer(self)
         self._toast_timer.setSingleShot(True)
         self._toast_timer.timeout.connect(self._clear_toast)
+
+        self._auto_hide_timer = QTimer(self)
+        self._auto_hide_timer.setSingleShot(True)
+        self._auto_hide_timer.timeout.connect(self._on_auto_hide_timeout)
 
     def _init_geometry(self) -> None:
         st = self.cfg_mgr.config.style
@@ -607,7 +612,26 @@ class LyricsSubtitleWindow(QWidget):
     def set_subtitle(self, original: str, translated: str) -> None:
         self._original_text = (original or "").strip()
         self._translated_text = (translated or "").strip()
+        self._auto_hidden = False
+        self._restart_auto_hide_timer()
         self.update()
+
+    def clear_for_empty_scene(self) -> None:
+        if not self._hovered and not self._dragging and self.cfg_mgr.config.auto_hide_seconds > 0:
+            self._auto_hidden = True
+            self.update()
+
+    def _restart_auto_hide_timer(self) -> None:
+        sec = int(self.cfg_mgr.config.auto_hide_seconds)
+        if sec > 0 and self._translated_text:
+            self._auto_hide_timer.start(sec * 1000)
+        else:
+            self._auto_hide_timer.stop()
+
+    def _on_auto_hide_timeout(self) -> None:
+        if not self._hovered and not self._dragging and self.cfg_mgr.config.auto_hide_seconds > 0:
+            self._auto_hidden = True
+            self.update()
 
     def current_subtitle(self) -> tuple[str, str]:
         return self._original_text, self._translated_text
@@ -656,6 +680,7 @@ class LyricsSubtitleWindow(QWidget):
     def enterEvent(self, event) -> None:
         if not self.cfg_mgr.config.style.locked_click_through:
             self._hovered = True
+            self._auto_hidden = False
             self._reposition_toolbar()
             self.toolbar.show()
             self.update()
@@ -794,6 +819,8 @@ class LyricsSubtitleWindow(QWidget):
         )
 
         st = self.cfg_mgr.config.style
+        if self._auto_hidden and not self._hovered and not self._toast_text:
+            return
         top_pad = 36.0 if self._hovered else 10.0
         content_rect = QRectF(14.0, top_pad, max(80.0, self.width() - 28.0), max(48.0, self.height() - top_pad - 10.0))
 

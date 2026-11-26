@@ -50,13 +50,13 @@ class MobileAudioEngine(
         micActive = true
         mainHandler.post {
             if (!SpeechRecognizer.isRecognitionAvailable(context)) {
-                AppStateBus.setStatus("⚠️ 当前系统未安装语音识别服务，可在设置配置云端/电脑局域网语音接口")
+                AppStateBus.setStatus("当前系统未安装语音识别服务，可在设置配置云端或电脑局域网语音接口")
                 return@post
             }
             speechRecognizer = SpeechRecognizer.createSpeechRecognizer(context).apply {
                 setRecognitionListener(object : RecognitionListener {
                     override fun onReadyForSpeech(params: Bundle?) {
-                        AppStateBus.setStatus("🎙️ 正在聆听麦克风外语语音...")
+                        AppStateBus.setStatus("正在聆听麦克风外语语音")
                     }
 
                     override fun onBeginningOfSpeech() {}
@@ -109,7 +109,7 @@ class MobileAudioEngine(
     fun startInternalAudioCapture(projection: MediaProjection?) {
         stopAll()
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q || projection == null) {
-            AppStateBus.setStatus("⚠️ 手机内部声音捕获需要先授予屏幕/内录捕获权限（Android 10+）")
+            AppStateBus.setStatus("手机内部声音捕获需要先授予屏幕与内录权限（Android 10+）")
             return
         }
 
@@ -142,11 +142,11 @@ class MobileAudioEngine(
             }.getOrNull()
 
             if (record == null || record.state != AudioRecord.STATE_INITIALIZED) {
-                AppStateBus.setStatus("⚠️ 初始化手机内录失败，请确认目标播放器允许音频捕获")
+                AppStateBus.setStatus("初始化手机内录失败，请确认目标播放器允许音频捕获")
                 return@launch
             }
 
-            AppStateBus.setStatus("🔊 正在捕获手机内部播放声音（生肉听译中）...")
+            AppStateBus.setStatus("正在捕获手机内部播放声音（生肉听译中）")
             record.startRecording()
 
             val chunkSamples = 1600 // 100ms at 16kHz
@@ -246,7 +246,7 @@ class MobileAudioEngine(
                 onRecognized("audio_internal", txt)
             }
         } else {
-            AppStateBus.setStatus("💡 手机内录已就绪：在同一 Wi-Fi 填写电脑端局域网地址即可免 Key 用电脑显卡听译，或切换麦克风流式听译")
+            AppStateBus.setStatus("手机内录已就绪：在同一 Wi-Fi 填写电脑端局域网地址即可用电脑听译，或切换麦克风模式")
         }
     }
 

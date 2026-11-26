@@ -28,6 +28,8 @@ class ScreenOCREngine:
         self._ocr_lock = threading.Lock()
         self._prev_thumb: Optional[np.ndarray] = None
         self._prev_text: str = ""
+        self._pending_candidate: str = ""
+        self._empty_streak: int = 0
 
     def warmup(self) -> None:
         """Pre-loads ONNX OCR engine and runs a tiny dummy pass in background after UI is visible."""
@@ -61,6 +63,8 @@ class ScreenOCREngine:
     def reset_dedup(self) -> None:
         self._prev_thumb = None
         self._prev_text = ""
+        self._pending_candidate = ""
+        self._empty_streak = 0
 
     @staticmethod
     def grab_region_bgr(x: int, y: int, w: int, h: int) -> Optional[np.ndarray]:
@@ -138,20 +142,46 @@ class ScreenOCREngine:
 
         return merged
 
-    def check_is_new_subtitle(self, text: str, similarity_cutoff: float = 0.88) -> bool:
+    def check_is_new_subtitle(
+        self, text: str, similarity_cutoff: float = 0.88, stabilize: bool = False
+    ) -> bool:
         clean = text.strip()
         if not clean:
+            self._pending_candidate = ""
             return False
+        self._empty_streak = 0
         if not self._prev_text:
             self._prev_text = clean
+            self._pending_candidate = ""
             return True
         if clean == self._prev_text:
+            self._pending_candidate = ""
             return False
         ratio = SequenceMatcher(None, clean, self._prev_text).ratio()
         if ratio >= similarity_cutoff:
+            self._pending_candidate = ""
             return False
+
+        # Optional 2-frame debounce prevents flashing single-frame transition artifacts
+        if stabilize:
+            if not self._pending_candidate:
+                self._pending_candidate = clean
+                return False
+            cand_sim = SequenceMatcher(None, clean, self._pending_candidate).ratio()
+            if cand_sim < 0.72:
+                self._pending_candidate = clean
+                return False
+            self._pending_candidate = ""
+
         self._prev_text = clean
         return True
+
+    def record_empty_frame(self) -> int:
+        self._empty_streak += 1
+        self._pending_candidate = ""
+        if self._empty_streak >= 3:
+            self._prev_text = ""
+        return self._empty_streak
 
     @staticmethod
     def _join_subtitle_fragments(parts: List[str]) -> str:

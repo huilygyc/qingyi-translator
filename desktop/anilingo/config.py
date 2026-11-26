@@ -181,11 +181,16 @@ class AppConfig:
     capture_region: List[int] = field(default_factory=lambda: [360, 780, 1200, 180])  # [x, y, w, h]
     region_interval_ms: int = 220
     show_region_border: bool = True
+    ocr_stabilize: bool = True
+
+    # Subtitle auto-hide & tray behavior
+    auto_hide_seconds: int = 6      # 0 = never hide; otherwise fade out after N seconds of no new lines
+    minimize_to_tray_on_close: bool = True
 
     # Audio capture & ASR settings
     audio_source: str = "loopback"  # "loopback" (电脑声音) | "mic" (说话麦克风)
     audio_device_index: int = -1    # -1 = auto default
-    whisper_model: str = "tiny"     # "tiny" | "base" | "small"
+    whisper_model: str = "tiny"     # "sensevoice" | "tiny" | "base" | "small"
     vad_energy_threshold: float = 0.012
     asr_cloud_api_base: str = ""
     asr_cloud_api_key: str = ""

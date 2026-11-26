@@ -36,7 +36,7 @@ class LyricsCanvasView(context: Context) : View(context) {
             invalidate()
         }
 
-    var translatedText: String = "番译姬悬浮歌词就绪"
+    var translatedText: String = "轻译悬浮字幕就绪"
         set(value) {
             field = value
             requestLayout()

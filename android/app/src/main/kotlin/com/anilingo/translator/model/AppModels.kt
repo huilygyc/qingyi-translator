@@ -6,7 +6,6 @@ import android.graphics.RectF
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import org.json.JSONArray
 import org.json.JSONObject
 
 data class LyricsPreset(
@@ -22,94 +21,95 @@ data class LyricsPreset(
 
 val MOBILE_LYRICS_PRESETS: List<LyricsPreset> = listOf(
     LyricsPreset(
-        key = "sakura_fansub",
-        title = "樱雪番剧（无底沉浸）",
+        key = "clean_cinema",
+        title = "纯净电影白（默认）",
         colorTop = Color.parseColor("#FFFFFF"),
-        colorBottom = Color.parseColor("#FFD4E8"),
-        origColor = Color.parseColor("#E6ECF5"),
-        strokeColor = Color.parseColor("#2B1838"),
+        colorBottom = Color.parseColor("#F1F5F9"),
+        origColor = Color.parseColor("#E2E8F0"),
+        strokeColor = Color.parseColor("#1E293B"),
         strokeWidthDp = 3.2f,
         bgAlpha = 0,
     ),
     LyricsPreset(
         key = "cloud_cyan",
-        title = "云音乐流光青",
+        title = "晴空冰蓝",
         colorTop = Color.parseColor("#FFFFFF"),
-        colorBottom = Color.parseColor("#7CE8FF"),
-        origColor = Color.parseColor("#D8F6FF"),
-        strokeColor = Color.parseColor("#0A253B"),
+        colorBottom = Color.parseColor("#BAE6FD"),
+        origColor = Color.parseColor("#E0F2FE"),
+        strokeColor = Color.parseColor("#0F2942"),
         strokeWidthDp = 3.3f,
-        bgAlpha = 34,
+        bgAlpha = 0,
     ),
     LyricsPreset(
         key = "amber_gold",
-        title = "琥珀流金（奇幻番剧）",
-        colorTop = Color.parseColor("#FFFDF5"),
-        colorBottom = Color.parseColor("#FFCA63"),
-        origColor = Color.parseColor("#F3E5C8"),
-        strokeColor = Color.parseColor("#261708"),
-        strokeWidthDp = 3.4f,
+        title = "暖调柔和黄",
+        colorTop = Color.parseColor("#FFFBEB"),
+        colorBottom = Color.parseColor("#FDE68A"),
+        origColor = Color.parseColor("#F3F4F6"),
+        strokeColor = Color.parseColor("#1F242D"),
+        strokeWidthDp = 3.3f,
         bgAlpha = 0,
     ),
     LyricsPreset(
         key = "fansub_classic",
-        title = "经典字幕组（深海蓝边）",
+        title = "字幕组深蓝边",
         colorTop = Color.parseColor("#FFFFFF"),
-        colorBottom = Color.parseColor("#F0F6FF"),
-        origColor = Color.parseColor("#DCE8FA"),
-        strokeColor = Color.parseColor("#143666"),
+        colorBottom = Color.parseColor("#F8FAFC"),
+        origColor = Color.parseColor("#E2E8F0"),
+        strokeColor = Color.parseColor("#1E3A5F"),
         strokeWidthDp = 3.5f,
         bgAlpha = 0,
     ),
     LyricsPreset(
         key = "mint_neon",
-        title = "薄荷霓虹（高对比清透）",
+        title = "清爽薄荷青",
         colorTop = Color.parseColor("#FFFFFF"),
-        colorBottom = Color.parseColor("#80FFDB"),
-        origColor = Color.parseColor("#D8FFF3"),
-        strokeColor = Color.parseColor("#0B2E26"),
+        colorBottom = Color.parseColor("#A7F3D0"),
+        origColor = Color.parseColor("#ECFDF5"),
+        strokeColor = Color.parseColor("#132A24"),
         strokeWidthDp = 3.2f,
-        bgAlpha = 26,
+        bgAlpha = 0,
     ),
     LyricsPreset(
         key = "soft_pill",
-        title = "柔光磨砂胶囊底",
+        title = "半透灰底条",
         colorTop = Color.parseColor("#FFFFFF"),
-        colorBottom = Color.parseColor("#EAEFFA"),
-        origColor = Color.parseColor("#C2CBE0"),
-        strokeColor = Color.parseColor("#000000"),
+        colorBottom = Color.parseColor("#F8FAFC"),
+        origColor = Color.parseColor("#CBD5E1"),
+        strokeColor = Color.parseColor("#0F172A"),
         strokeWidthDp = 1.8f,
-        bgAlpha = 155,
+        bgAlpha = 148,
     ),
 )
 
 data class MobileLyricsStyle(
-    val presetKey: String = "sakura_fansub",
-    val baseFontSp: Float = 21f,
+    val presetKey: String = "clean_cinema",
+    val baseFontSp: Float = 20f,
     val autoScaleFont: Boolean = true,
     val bilingual: Boolean = true,
     val colorTop: Int = Color.parseColor("#FFFFFF"),
-    val colorBottom: Int = Color.parseColor("#FFD4E8"),
-    val origColor: Int = Color.parseColor("#E6ECF5"),
-    val strokeColor: Int = Color.parseColor("#2B1838"),
+    val colorBottom: Int = Color.parseColor("#F1F5F9"),
+    val origColor: Int = Color.parseColor("#E2E8F0"),
+    val strokeColor: Int = Color.parseColor("#1E293B"),
     val strokeWidthDp: Float = 3.2f,
-    val shadowRadiusDp: Float = 4.0f,
+    val shadowRadiusDp: Float = 3.8f,
     val bgAlpha: Int = 0,
+    val autoHideSeconds: Int = 6,
     val lockedClickThrough: Boolean = false,
 )
 
 data class MobileEngineConfig(
-    val transEngine: String = "auto_free", // "auto_free" | "deepseek" | "pc_lan"
+    val transEngine: String = "auto_free", // "auto_free" | "cn_direct" | "deepseek" | "pc_lan"
     val sourceLang: String = "ja",         // "ja" | "en" | "ko" | "auto"
     val targetLang: String = "zh-CN",
     val llmApiBase: String = "https://api.deepseek.com/v1",
     val llmApiKey: String = "",
     val llmModel: String = "deepseek-chat",
-    val pcLanUrl: String = "",             // e.g. http://192.168.1.10:18765
-    val audioSource: String = "mic",       // "mic" (说话/外放) | "internal" (手机系统内录)
+    val pcLanUrl: String = "",
+    val audioSource: String = "mic",       // "mic" | "internal"
     val whisperCloudBase: String = "",
     val whisperCloudKey: String = "",
-    val pollIntervalMs: Long = 650L,
+    val pollIntervalMs: Long = 350L,
 )
 
 data class SubtitleRecord(
@@ -119,11 +119,8 @@ data class SubtitleRecord(
     val translated: String,
 )
 
-/**
- * Shared reactive state bus & SharedPreferences persistence across Compose UI and WindowManager Service.
- */
 object AppStateBus {
-    private const val PREF_NAME = "anilingo_prefs"
+    private const val PREF_NAME = "qingyi_prefs_v2"
 
     private val _overlayRunning = MutableStateFlow(false)
     val overlayRunning: StateFlow<Boolean> = _overlayRunning.asStateFlow()
@@ -134,13 +131,13 @@ object AppStateBus {
     private val _liveAudioActive = MutableStateFlow(false)
     val liveAudioActive: StateFlow<Boolean> = _liveAudioActive.asStateFlow()
 
-    private val _currentOriginal = MutableStateFlow("アニメ字幕・音声リアルタイム翻訳")
+    private val _currentOriginal = MutableStateFlow("Subtitles ready")
     val currentOriginal: StateFlow<String> = _currentOriginal.asStateFlow()
 
-    private val _currentTranslated = MutableStateFlow("番译姬手机端就绪 · 点悬浮字幕可框选抓词 / 截屏翻译 / 改词")
+    private val _currentTranslated = MutableStateFlow("悬浮字幕已就绪，轻触可展开控制条")
     val currentTranslated: StateFlow<String> = _currentTranslated.asStateFlow()
 
-    private val _statusText = MutableStateFlow("就绪 · 支持全局悬浮歌词、屏幕区域翻译与手机内录/说话听译")
+    private val _statusText = MutableStateFlow("就绪")
     val statusText: StateFlow<String> = _statusText.asStateFlow()
 
     private val _style = MutableStateFlow(MobileLyricsStyle())
@@ -149,7 +146,6 @@ object AppStateBus {
     private val _engineConfig = MutableStateFlow(MobileEngineConfig())
     val engineConfig: StateFlow<MobileEngineConfig> = _engineConfig.asStateFlow()
 
-    // Normalized screen region [0..1] so portrait & landscape anime playback both map cleanly
     private val _captureRegionNorm = MutableStateFlow(RectF(0.08f, 0.72f, 0.92f, 0.91f))
     val captureRegionNorm: StateFlow<RectF> = _captureRegionNorm.asStateFlow()
 
@@ -177,16 +173,17 @@ object AppStateBus {
         initialized = true
         val sp = context.applicationContext.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
         _style.value = MobileLyricsStyle(
-            presetKey = sp.getString("presetKey", "sakura_fansub") ?: "sakura_fansub",
-            baseFontSp = sp.getFloat("baseFontSp", 21f),
+            presetKey = sp.getString("presetKey", "clean_cinema") ?: "clean_cinema",
+            baseFontSp = sp.getFloat("baseFontSp", 20f),
             autoScaleFont = sp.getBoolean("autoScaleFont", true),
             bilingual = sp.getBoolean("bilingual", true),
             colorTop = sp.getInt("colorTop", Color.parseColor("#FFFFFF")),
-            colorBottom = sp.getInt("colorBottom", Color.parseColor("#FFD4E8")),
-            origColor = sp.getInt("origColor", Color.parseColor("#E6ECF5")),
-            strokeColor = sp.getInt("strokeColor", Color.parseColor("#2B1838")),
+            colorBottom = sp.getInt("colorBottom", Color.parseColor("#F1F5F9")),
+            origColor = sp.getInt("origColor", Color.parseColor("#E2E8F0")),
+            strokeColor = sp.getInt("strokeColor", Color.parseColor("#1E293B")),
             strokeWidthDp = sp.getFloat("strokeWidthDp", 3.2f),
             bgAlpha = sp.getInt("bgAlpha", 0),
+            autoHideSeconds = sp.getInt("autoHideSeconds", 6),
             lockedClickThrough = false,
         )
         _engineConfig.value = MobileEngineConfig(
@@ -200,7 +197,7 @@ object AppStateBus {
             audioSource = sp.getString("audioSource", "mic") ?: "mic",
             whisperCloudBase = sp.getString("whisperCloudBase", "") ?: "",
             whisperCloudKey = sp.getString("whisperCloudKey", "") ?: "",
-            pollIntervalMs = sp.getLong("pollIntervalMs", 650L),
+            pollIntervalMs = sp.getLong("pollIntervalMs", 350L),
         )
         _captureRegionNorm.value = RectF(
             sp.getFloat("regL", 0.08f),
@@ -242,6 +239,7 @@ object AppStateBus {
             .putInt("strokeColor", st.strokeColor)
             .putFloat("strokeWidthDp", st.strokeWidthDp)
             .putInt("bgAlpha", st.bgAlpha)
+            .putInt("autoHideSeconds", st.autoHideSeconds)
             .putString("transEngine", ec.transEngine)
             .putString("sourceLang", ec.sourceLang)
             .putString("targetLang", ec.targetLang)
@@ -330,7 +328,7 @@ object AppStateBus {
             curList[curList.lastIndex] = last.copy(original = newOrig.trim(), translated = newTrans.trim())
             _history.value = curList
         } else {
-            publishSubtitle("manual", newOrig, newTrans)
+            publishSubtitle("手动", newOrig, newTrans)
         }
     }
 

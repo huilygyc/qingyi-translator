@@ -1,11 +1,14 @@
-"""Low-Latency Multi-Engine Translator with Persistent HTTPS Keep-Alive Pooling, Adaptive Routing & Anime Glossary."""
+"""Low-Latency Concurrent-Racing Translator (China Direct + Google Keep-Alive + DeepSeek LLM + Glossary)."""
 
 from __future__ import annotations
 
+import concurrent.futures
+import html as html_mod
 import http.client
 import json
 import re
 import threading
+import time
 import urllib.parse
 from collections import OrderedDict
 from typing import Dict, List, Optional, Tuple
@@ -14,9 +17,9 @@ from .config import ConfigManager
 
 
 class _KeepAliveClient:
-    """Thread-safe persistent HTTP/HTTPS connection reusing the TLS socket across subtitle translations (~200ms)."""
+    """Thread-safe persistent HTTP/HTTPS connection reusing TLS sockets across lines."""
 
-    def __init__(self, host: str, use_https: bool = True, port: Optional[int] = None, timeout: float = 2.8) -> None:
+    def __init__(self, host: str, use_https: bool = True, port: Optional[int] = None, timeout: float = 2.6) -> None:
         self.host = host
         self.use_https = use_https
         self.port = port
@@ -40,10 +43,17 @@ class _KeepAliveClient:
                 pass
             self._conn = None
 
-    def request(self, method: str, path: str, body: Optional[bytes] = None, headers: Optional[Dict[str, str]] = None) -> bytes:
+    def request(
+        self,
+        method: str,
+        path: str,
+        body: Optional[bytes] = None,
+        headers: Optional[Dict[str, str]] = None,
+        keep_alive: bool = True,
+    ) -> bytes:
         req_headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Connection": "keep-alive",
+            "Connection": "keep-alive" if keep_alive else "close",
         }
         if headers:
             req_headers.update(headers)
@@ -55,6 +65,8 @@ class _KeepAliveClient:
                     conn.request(method, path, body=body, headers=req_headers)
                     resp = conn.getresponse()
                     data = resp.read()
+                    if not keep_alive:
+                        self._reset()
                     if resp.status >= 400:
                         raise RuntimeError(f"HTTP {resp.status}")
                     return data
@@ -66,32 +78,39 @@ class _KeepAliveClient:
 
 
 class TranslationService:
-    """Translates anime subtitles/speech with persistent Keep-Alive pooling, glossary protection & adaptive failover."""
+    """
+    Translates anime subtitles/speech with:
+    - 'auto_free': Concurrent parallel racing between Google Keep-Alive & China-direct Youdao/MyMemory (first valid wins!)
+    - 'cn_direct': Mainland China direct zero-proxy channels (Youdao Mobile + MyMemory)
+    - 'google_first': Google Keep-Alive preferred with domestic fallback
+    - 'deepseek' / 'openai_compat': LLM context-aware anime fansub translation
+    """
 
     def __init__(self, cfg_mgr: ConfigManager) -> None:
         self.cfg_mgr = cfg_mgr
         self._cache: OrderedDict[str, str] = OrderedDict()
         self._context_window: List[Tuple[str, str]] = []
         self._lock = threading.RLock()
+        self._race_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="TransRace")
 
-        # Persistent Keep-Alive pools eliminate ~500-700ms TLS handshakes per subtitle line
         self._clients: Dict[str, _KeepAliveClient] = {
-            "chrome_dict": _KeepAliveClient("clients5.google.com", True, timeout=2.5),
-            "google_gtx": _KeepAliveClient("translate.googleapis.com", True, timeout=2.5),
-            "mymemory": _KeepAliveClient("api.mymemory.translated.net", True, timeout=3.5),
+            "chrome_dict": _KeepAliveClient("clients5.google.com", True, timeout=2.2),
+            "google_gtx": _KeepAliveClient("translate.googleapis.com", True, timeout=2.2),
+            "youdao_m": _KeepAliveClient("m.youdao.com", True, timeout=2.8),
+            "mymemory": _KeepAliveClient("api.mymemory.translated.net", True, timeout=3.2),
         }
         self._llm_clients: Dict[str, _KeepAliveClient] = {}
-        self._channel_order: List[str] = ["chrome_dict", "google_gtx", "mymemory"]
+        self._cooldown_until: Dict[str, float] = {}
 
     def warmup_connections(self) -> None:
-        """Pre-establishes the primary TLS socket in background right after startup so subtitle #1 is fast."""
-        try:
-            self._call_free_channel("chrome_dict", "hello", "en", "zh-CN")
-        except Exception:
+        """Pre-establishes primary sockets in background so subtitle #1 has minimal TLS latency."""
+        mode = self.cfg_mgr.config.trans_engine
+        targets = ["youdao_m"] if mode == "cn_direct" else ["chrome_dict", "youdao_m"]
+        for ch in targets:
             try:
-                self._call_free_channel("google_gtx", "hello", "en", "zh-CN")
+                self._call_free_channel(ch, "hello", "en", "zh-CN")
             except Exception:
-                pass
+                self._mark_cooldown(ch, 45.0)
 
     def clear_cache(self) -> None:
         with self._lock:
@@ -102,6 +121,12 @@ class TranslationService:
             keys_to_remove = [k for k in self._cache if k.endswith(f"::{original.strip()}")]
             for k in keys_to_remove:
                 self._cache.pop(k, None)
+
+    def _is_cooling_down(self, ch: str) -> bool:
+        return time.monotonic() < self._cooldown_until.get(ch, 0.0)
+
+    def _mark_cooldown(self, ch: str, seconds: float = 90.0) -> None:
+        self._cooldown_until[ch] = time.monotonic() + seconds
 
     def translate(self, text: str, force_refresh: bool = False) -> str:
         clean = self._normalize_input(text)
@@ -152,7 +177,6 @@ class TranslationService:
         return re.sub(r"\s+", " ", text or "").strip()
 
     def _pre_replace_glossary_for_free(self, text: str, glossary: Dict[str, str]) -> Tuple[str, List[Tuple[str, str]]]:
-        """Replaces matched glossary source terms with invariant placeholders [#0#] so MT never alters them."""
         if not glossary:
             return text, []
         out = text
@@ -214,6 +238,36 @@ class TranslationService:
                 joined = "".join(seg[0] for seg in data[0] if seg and seg[0])
                 if joined.strip():
                     return joined.strip()
+        elif channel == "youdao_m":
+            if not tl.startswith("zh"):
+                return ""
+            guessed = sl if sl != "auto" else self._guess_lang(prepared)
+            yd_type_map = {
+                "ja": "JA2ZH_CN",
+                "en": "EN2ZH_CN",
+                "ko": "KR2ZH_CN",
+                "fr": "FR2ZH_CN",
+                "ru": "RU2ZH_CN",
+            }
+            yd_type = yd_type_map.get(guessed, "AUTO")
+            body = urllib.parse.urlencode({"inputtext": prepared, "type": yd_type}).encode("utf-8")
+            raw = self._clients["youdao_m"].request(
+                "POST",
+                "/translate",
+                body=body,
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Referer": "https://m.youdao.com/translate",
+                    "User-Agent": "Mozilla/5.0 (Linux; Android 14)",
+                },
+                keep_alive=False,
+            )
+            page = raw.decode("utf-8", errors="ignore")
+            m = re.search(r'<ul id="translateResult">\s*<li>(.*?)</li>', page, re.S)
+            if m:
+                val = html_mod.unescape(re.sub(r"<[^>]+>", "", m.group(1))).strip()
+                if val and val != prepared:
+                    return val
         elif channel == "mymemory":
             src_mm = sl if sl != "auto" else self._guess_lang(prepared)
             langpair = urllib.parse.quote(f"{src_mm}|{tl}")
@@ -224,28 +278,54 @@ class TranslationService:
                 return str(t_text).strip()
         return ""
 
+    def _race_channels(self, channels: List[str], prepared: str, sl: str, tl: str) -> str:
+        """Runs candidate channels concurrently and returns immediately on the first valid translation."""
+        active = [ch for ch in channels if not self._is_cooling_down(ch)]
+        if not active:
+            active = list(channels)
+
+        futures = {
+            self._race_pool.submit(self._call_free_channel, ch, prepared, sl, tl): ch
+            for ch in active
+        }
+        try:
+            for fut in concurrent.futures.as_completed(futures, timeout=3.2):
+                ch = futures[fut]
+                try:
+                    res = fut.result()
+                    if res:
+                        self._cooldown_until.pop(ch, None)
+                        return res
+                except Exception:
+                    self._mark_cooldown(ch, 75.0)
+        except concurrent.futures.TimeoutError:
+            pass
+        return ""
+
     def _translate_via_free_channels(self, text: str, glossary: Dict[str, str]) -> str:
         cfg = self.cfg_mgr.config
         prepared, placeholders = self._pre_replace_glossary_for_free(text, glossary)
         sl = cfg.source_lang if cfg.source_lang != "auto" else "auto"
         tl = cfg.target_lang
 
-        with self._lock:
-            order = list(self._channel_order)
-
-        for idx, ch in enumerate(order):
-            try:
-                res = self._call_free_channel(ch, prepared, sl, tl)
-                if res:
-                    # Promote the winning fast channel to front so subsequent lines avoid slow fallbacks
-                    if idx != 0:
-                        with self._lock:
-                            if ch in self._channel_order:
-                                self._channel_order.remove(ch)
-                                self._channel_order.insert(0, ch)
-                    return self._restore_placeholders(res, placeholders)
-            except Exception:
-                continue
+        if cfg.trans_engine == "cn_direct":
+            # Mainland China direct zero-proxy racing (never stalls on Google)
+            res = self._race_channels(["youdao_m", "mymemory"], prepared, sl, tl)
+            if res:
+                return self._restore_placeholders(res, placeholders)
+        elif cfg.trans_engine == "google_first":
+            res = self._race_channels(["chrome_dict", "google_gtx"], prepared, sl, tl)
+            if not res:
+                res = self._race_channels(["youdao_m", "mymemory"], prepared, sl, tl)
+            if res:
+                return self._restore_placeholders(res, placeholders)
+        else:
+            # Default 'auto_free': race Google Keep-Alive + China-direct Youdao concurrently!
+            res = self._race_channels(["chrome_dict", "youdao_m"], prepared, sl, tl)
+            if not res:
+                res = self._race_channels(["google_gtx", "mymemory"], prepared, sl, tl)
+            if res:
+                return self._restore_placeholders(res, placeholders)
 
         return self._restore_placeholders(prepared, placeholders)
 

@@ -24,7 +24,7 @@ jobs:
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          python -m pip install PySide6 rapidocr onnxruntime faster-whisper PyAudioWPatch mss opencv-python pillow pyinstaller
+          python -m pip install PySide6 rapidocr onnxruntime faster-whisper sherpa-onnx PyAudioWPatch mss opencv-python pillow pyinstaller
           python -c "import numpy as np; from rapidocr import RapidOCR; eng = RapidOCR(); eng(np.zeros((80, 240, 3), dtype=np.uint8))"
 
       - name: Package Standalone Windows EXE
@@ -39,11 +39,17 @@ jobs:
             --collect-data faster_whisper `
             --collect-binaries onnxruntime `
             --collect-binaries ctranslate2 `
+            --collect-binaries sherpa_onnx `
             --hidden-import rapidocr `
             --hidden-import faster_whisper `
+            --hidden-import sherpa_onnx `
             --hidden-import pyaudiowpatch `
             --hidden-import mss `
             --hidden-import cv2 `
+            --exclude-module PySide6.QtWebEngineCore `
+            --exclude-module PySide6.QtWebEngineWidgets `
+            --exclude-module PySide6.Qt3DCore `
+            --exclude-module PySide6.QtMultimedia `
             run_desktop.py
           Compress-Archive -Path "dist_win\轻译" -DestinationPath "..\QingYi-Windows-x64.zip" -Force
 
@@ -51,15 +57,17 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          name: "轻译 ${{ github.ref_name }}（极速低延迟版 · Windows EXE + Android APK）"
+          name: "轻译 ${{ github.ref_name }}（国内直连竞速 · SenseVoice 动漫语音 · 双端统一浅色版）"
           body: |
             ### 更新内容
-            - 桌面端本地多语种识字提速至 **~45ms**（修复宽字幕条多余放大与多核线程争用）。
-            - 新增 HTTPS Keep-Alive 长连接池与启动预热，在线翻译延迟降至 **~220ms**，整体出字幕延迟压缩至 **0.3 ～ 0.5 秒**。
-            - 屏幕采样间隔默认提升至 **0.22 秒**，语音停顿断句优化至 **0.32 秒**。
+            - **国内直连免费翻译与多线程竞速**：内置有道移动端、MyMemory 与 Google Keep-Alive 并发竞速，最快通道优先返回，国内无需代理也可稳定使用，同时支持“仅国内直连”模式。
+            - **SenseVoiceSmall 动漫语音听译**：桌面端新增 `SenseVoiceSmall`（ONNX）选项，对日语动漫语速、情绪与背景音乐抗噪表现显著优于 Whisper-tiny，首次选用自动下载轻量模型并支持回退。
+            - **看番细节优化**：新增无台词自动隐身（默认 6 秒，空帧自动收起）、OCR 双帧防抖（过滤淡入淡出残影）以及点击关闭最小化到系统托盘防误退出。
+            - **Android 端全面重做**：统一为与桌面端一致的极简浅色界面（零颜文字）、4 页结构与 6 套影院/歌词主题，轮询提速至 350ms 并同步升级并发翻译竞速。
+            - **版本更新检查**：桌面端偏好设置内置“检查新版本”按钮，一键对比 GitHub 最新版本。
 
             ### 下载安装说明
-            1. **Windows 电脑免安装便携版 (`QingYi-Windows-x64.zip`)**：下载解压后双击 `轻译/轻译.exe` 即可打开浅色控制面板使用。
+            1. **Windows 电脑免安装便携版 (`QingYi-Windows-x64.zip`)**：下载解压后双击 `轻译/轻译.exe` 即可打开浅色控制面板。由于开源软件暂未购买商业代码签名证书，首次运行若遇 Windows Defender 蓝屏拦截，点击“更多信息” -> “仍要运行”即可。
             2. **Android 手机全局悬浮窗版 (`QingYi-Android.apk`)**：下载安装至 Android 手机，开启悬浮窗权限即可使用。
           files: |
             QingYi-Windows-x64.zip

@@ -1,7 +1,7 @@
 package com.anilingo.translator.ui.main
 
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -17,7 +17,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
@@ -25,7 +24,6 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.FilterChip
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
@@ -57,6 +55,15 @@ import com.anilingo.translator.model.AppStateBus
 import com.anilingo.translator.model.MOBILE_LYRICS_PRESETS
 import kotlinx.coroutines.launch
 
+private val CanvasBg = Color(0xFFF5F7FA)
+private val CardWhite = Color(0xFFFFFFFF)
+private val CardBorder = Color(0xFFE5E9F0)
+private val PrimaryBlue = Color(0xFF2563EB)
+private val StopRedBg = Color(0xFFFEE2E2)
+private val StopRedText = Color(0xFFDC2626)
+private val TextMain = Color(0xFF0F172A)
+private val TextSub = Color(0xFF64748B)
+
 @Composable
 fun AniLingoMainScreen(
     onToggleOverlay: () -> Unit,
@@ -68,50 +75,48 @@ fun AniLingoMainScreen(
     var selectedTab by remember { mutableIntStateOf(0) }
     val statusText by AppStateBus.statusText.collectAsState()
 
-    val bgDark = Color(0xFF121521)
-    val cardBg = Color(0xFF1B2032)
-    val accentPink = Color(0xFFE05297)
-
     Scaffold(
-        containerColor = bgDark,
+        containerColor = CanvasBg,
         topBar = {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .background(Color(0xFF171B2A))
-                    .padding(top = 38.dp, start = 16.dp, end = 16.dp, bottom = 8.dp)
+                    .background(CardWhite)
+                    .padding(top = 40.dp, start = 18.dp, end = 18.dp, bottom = 0.dp)
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        text = "🌸 番译姬 AniLingo",
-                        color = Color(0xFFFFB8D9),
-                        fontSize = 20.sp,
-                        fontWeight = FontWeight.ExtraBold
-                    )
+                    Box(
+                        modifier = Modifier
+                            .size(30.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(PrimaryBlue),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text("译", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                    }
                     Spacer(Modifier.width(10.dp))
-                    Text(
-                        text = "手机悬浮歌词实时看番翻译",
-                        color = Color(0xFF9AA6C4),
-                        fontSize = 12.sp
-                    )
+                    Text("轻译", color = TextMain, fontSize = 19.sp, fontWeight = FontWeight.Bold)
+                    Spacer(Modifier.width(10.dp))
+                    Text(statusText, color = TextSub, fontSize = 12.sp)
                 }
-                Spacer(Modifier.height(6.dp))
-                Text(
-                    text = statusText,
-                    color = Color(0xFF8CE4FF),
-                    fontSize = 12.sp
-                )
-                Spacer(Modifier.height(8.dp))
+                Spacer(Modifier.height(10.dp))
                 TabRow(
                     selectedTabIndex = selectedTab,
-                    containerColor = Color(0xFF171B2A),
-                    contentColor = Color(0xFFFFB8D9)
+                    containerColor = CardWhite,
+                    contentColor = PrimaryBlue
                 ) {
-                    listOf("🎬 翻译台", "🎨 歌词样式", "📖 改词/词表", "⚙️ 引擎联动").forEachIndexed { idx, title ->
+                    listOf("实时翻译", "字幕外观", "词表记录", "偏好设置").forEachIndexed { idx, title ->
                         Tab(
                             selected = selectedTab == idx,
                             onClick = { selectedTab = idx },
-                            text = { Text(title, fontSize = 12.5.sp, fontWeight = FontWeight.SemiBold) }
+                            text = {
+                                Text(
+                                    text = title,
+                                    fontSize = 13.sp,
+                                    fontWeight = if (selectedTab == idx) FontWeight.Bold else FontWeight.Medium,
+                                    color = if (selectedTab == idx) PrimaryBlue else TextSub
+                                )
+                            }
                         )
                     }
                 }
@@ -122,22 +127,34 @@ fun AniLingoMainScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding)
-                .padding(14.dp)
+                .padding(16.dp)
         ) {
             when (selectedTab) {
                 0 -> DashboardTab(
-                    cardBg = cardBg,
-                    accentPink = accentPink,
                     onToggleOverlay = onToggleOverlay,
                     onPickRegion = onPickRegion,
                     onToggleLiveScreen = onToggleLiveScreen,
                     onStartSnip = onStartSnip,
                     onToggleAudio = onToggleAudio,
                 )
-                1 -> LyricsStyleTab(cardBg = cardBg)
-                2 -> EditAndGlossaryTab(cardBg = cardBg, accentPink = accentPink)
-                3 -> EngineSettingsTab(cardBg = cardBg, accentPink = accentPink)
+                1 -> LyricsStyleTab()
+                2 -> EditAndGlossaryTab()
+                3 -> EngineSettingsTab()
             }
+        }
+    }
+}
+
+@Composable
+private fun CleanCard(content: @Composable () -> Unit) {
+    Card(
+        colors = CardDefaults.cardColors(containerColor = CardWhite),
+        border = BorderStroke(1.dp, CardBorder),
+        shape = RoundedCornerShape(14.dp),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            content()
         }
     }
 }
@@ -145,8 +162,6 @@ fun AniLingoMainScreen(
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun DashboardTab(
-    cardBg: Color,
-    accentPink: Color,
     onToggleOverlay: () -> Unit,
     onPickRegion: () -> Unit,
     onToggleLiveScreen: () -> Unit,
@@ -163,109 +178,93 @@ private fun DashboardTab(
         modifier = Modifier
             .fillMaxSize()
             .verticalScroll(rememberScrollState()),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
+        verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
-        // Master Floating Window Switch Card
-        Card(
-            colors = CardDefaults.cardColors(containerColor = cardBg),
-            shape = RoundedCornerShape(16.dp)
-        ) {
-            Column(Modifier.padding(15.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text("🎵 第一步：开启全局音乐歌词级悬浮字幕窗", color = Color(0xFFFFD2E8), fontWeight = FontWeight.Bold)
-                Text(
-                    "开启后可切换到 B站、MX Player、浏览器等任意看番软件上方悬浮显示；轻触悬浮字幕即弹出迷你操作栏，支持拖拽、换肤、改词与触摸穿透锁定。",
-                    color = Color(0xFFB5C0DA),
-                    fontSize = 12.5.sp
+        CleanCard {
+            Text("全局悬浮字幕", color = TextMain, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+            Text("开启后可在其他视频软件上方悬浮显示字幕，轻触字幕可展开快捷控制条。", color = TextSub, fontSize = 12.5.sp)
+            Button(
+                onClick = onToggleOverlay,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = if (overlayRunning) StopRedBg else PrimaryBlue,
+                    contentColor = if (overlayRunning) StopRedText else Color.White,
+                ),
+                shape = RoundedCornerShape(9.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(if (overlayRunning) "关闭悬浮字幕" else "开启悬浮字幕", fontWeight = FontWeight.SemiBold)
+            }
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                listOf("ja" to "日语", "en" to "英语", "ko" to "韩语", "auto" to "自动识别").forEach { (code, label) ->
+                    FilterChip(
+                        selected = engineCfg.sourceLang == code,
+                        onClick = {
+                            AppStateBus.updateEngineConfig(ctx) { it.copy(sourceLang = code) }
+                            MobileTranslator.clearCache()
+                        },
+                        label = { Text(label, fontSize = 12.sp) }
+                    )
+                }
+            }
+        }
+
+        CleanCard {
+            Text("屏幕区域与截图翻译", color = TextMain, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+            Text("框选固定字幕区域自动实时翻译，或随时单次框选画面翻译。", color = TextSub, fontSize = 12.5.sp)
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+                OutlinedButton(
+                    onClick = onPickRegion,
+                    shape = RoundedCornerShape(9.dp),
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text("框选区域")
+                }
+                Button(
+                    onClick = onToggleLiveScreen,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (liveScreen) StopRedBg else PrimaryBlue,
+                        contentColor = if (liveScreen) StopRedText else Color.White,
+                    ),
+                    shape = RoundedCornerShape(9.dp),
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text(if (liveScreen) "停止翻译" else "开始翻译", fontWeight = FontWeight.SemiBold)
+                }
+            }
+            OutlinedButton(
+                onClick = onStartSnip,
+                shape = RoundedCornerShape(9.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("框选截屏翻译")
+            }
+        }
+
+        CleanCard {
+            Text("声音实时翻译", color = TextMain, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+            Text("识别麦克风说话声或手机系统内部播放原声。", color = TextSub, fontSize = 12.5.sp)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilterChip(
+                    selected = engineCfg.audioSource == "mic",
+                    onClick = { AppStateBus.updateEngineConfig(ctx) { it.copy(audioSource = "mic") } },
+                    label = { Text("麦克风说话") }
                 )
-                Button(
-                    onClick = onToggleOverlay,
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = if (overlayRunning) Color(0xFFD97706) else accentPink
-                    ),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text(
-                        if (overlayRunning) "⏹️ 关闭全局悬浮歌词窗" else "🚀 开启全局悬浮歌词窗",
-                        fontWeight = FontWeight.Bold
-                    )
-                }
-
-                // Source language selector
-                Text("源语言选择：", color = Color(0xFFD6DFF5), fontSize = 12.5.sp)
-                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf("ja" to "日语(生肉/日字)", "en" to "英语(英字)", "ko" to "韩语", "auto" to "自动识别").forEach { (code, label) ->
-                        FilterChip(
-                            selected = engineCfg.sourceLang == code,
-                            onClick = {
-                                AppStateBus.updateEngineConfig(ctx) { it.copy(sourceLang = code) }
-                                MobileTranslator.clearCache()
-                            },
-                            label = { Text(label, fontSize = 12.sp) }
-                        )
-                    }
-                }
+                FilterChip(
+                    selected = engineCfg.audioSource == "internal",
+                    onClick = { AppStateBus.updateEngineConfig(ctx) { it.copy(audioSource = "internal") } },
+                    label = { Text("手机系统内录") }
+                )
             }
-        }
-
-        // Screen Region & One-Shot Snip Card
-        Card(
-            colors = CardDefaults.cardColors(containerColor = cardBg),
-            shape = RoundedCornerShape(16.dp)
-        ) {
-            Column(Modifier.padding(15.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text("📺 屏幕实时区域抓词 & 框选截屏翻译", color = Color(0xFF8CE4FF), fontWeight = FontWeight.Bold)
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                    OutlinedButton(onClick = onPickRegion, modifier = Modifier.weight(1f)) {
-                        Text("🖱️ 框选字幕区")
-                    }
-                    Button(
-                        onClick = onToggleLiveScreen,
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = if (liveScreen) Color(0xFFD97706) else Color(0xFF1F7A99)
-                        ),
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Text(if (liveScreen) "⏹️ 停止盯屏" else "▶️ 实时盯屏")
-                    }
-                }
-                Button(
-                    onClick = onStartSnip,
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF39466E)),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text("✂️ 立即手指框选截屏翻译（任意画面/气泡/标题）")
-                }
-            }
-        }
-
-        // Voice & Internal Audio Translation Card
-        Card(
-            colors = CardDefaults.cardColors(containerColor = cardBg),
-            shape = RoundedCornerShape(16.dp)
-        ) {
-            Column(Modifier.padding(15.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text("🎧 声音实时听译（说话麦克风 / 手机内部播放声音）", color = Color(0xFF9EFFD6), fontWeight = FontWeight.Bold)
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    FilterChip(
-                        selected = engineCfg.audioSource == "mic",
-                        onClick = { AppStateBus.updateEngineConfig(ctx) { it.copy(audioSource = "mic") } },
-                        label = { Text("🎙️ 麦克风说话/外放声音") }
-                    )
-                    FilterChip(
-                        selected = engineCfg.audioSource == "internal",
-                        onClick = { AppStateBus.updateEngineConfig(ctx) { it.copy(audioSource = "internal") } },
-                        label = { Text("🔊 手机系统内录(Android 10+)") }
-                    )
-                }
-                Button(
-                    onClick = onToggleAudio,
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = if (liveAudio) Color(0xFFD97706) else accentPink
-                    ),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text(if (liveAudio) "⏹️ 停止声音实时听译" else "🎙️ 开始声音实时翻译")
-                }
+            Button(
+                onClick = onToggleAudio,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = if (liveAudio) StopRedBg else PrimaryBlue,
+                    contentColor = if (liveAudio) StopRedText else Color.White,
+                ),
+                shape = RoundedCornerShape(9.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(if (liveAudio) "停止听译" else "开始听译", fontWeight = FontWeight.SemiBold)
             }
         }
     }
@@ -273,7 +272,7 @@ private fun DashboardTab(
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun LyricsStyleTab(cardBg: Color) {
+private fun LyricsStyleTab() {
     val ctx = LocalContext.current
     val st by AppStateBus.style.collectAsState()
     val curOrig by AppStateBus.currentOriginal.collectAsState()
@@ -283,16 +282,14 @@ private fun LyricsStyleTab(cardBg: Color) {
         modifier = Modifier
             .fillMaxSize()
             .verticalScroll(rememberScrollState()),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
+        verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
-        // Live Style Preview Box
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .clip(RoundedCornerShape(16.dp))
-                .background(Brush.horizontalGradient(listOf(Color(0xFF231934), Color(0xFF14293A))))
-                .border(1.dp, Color(0x55FFB8D9), RoundedCornerShape(16.dp))
-                .padding(18.dp),
+                .clip(RoundedCornerShape(14.dp))
+                .background(Brush.horizontalGradient(listOf(Color(0xFF334155), Color(0xFF475569))))
+                .padding(20.dp),
             contentAlignment = Alignment.Center
         ) {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -315,66 +312,72 @@ private fun LyricsStyleTab(cardBg: Color) {
             }
         }
 
-        Card(colors = CardDefaults.cardColors(containerColor = cardBg), shape = RoundedCornerShape(16.dp)) {
-            Column(Modifier.padding(15.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text("🎨 听歌桌面歌词级主题预设", color = Color(0xFFFFD2E8), fontWeight = FontWeight.Bold)
-                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    MOBILE_LYRICS_PRESETS.forEach { preset ->
-                        FilterChip(
-                            selected = st.presetKey == preset.key,
-                            onClick = { AppStateBus.applyPreset(ctx, preset) },
-                            label = { Text(preset.title, fontSize = 12.sp) }
-                        )
-                    }
-                }
-
-                Text("基准字幕大小：${st.baseFontSp.toInt()} sp", color = Color.White, fontSize = 13.sp)
-                Slider(
-                    value = st.baseFontSp,
-                    onValueChange = { v -> AppStateBus.updateStyle(ctx) { it.copy(baseFontSp = v) } },
-                    valueRange = 14f..36f
-                )
-
-                Text("描边粗细：${"%.1f".format(st.strokeWidthDp)} dp", color = Color.White, fontSize = 13.sp)
-                Slider(
-                    value = st.strokeWidthDp,
-                    onValueChange = { v -> AppStateBus.updateStyle(ctx) { it.copy(strokeWidthDp = v) } },
-                    valueRange = 0f..6f
-                )
-
-                Text(
-                    text = if (st.bgAlpha == 0) "底板透明度：0%（全透明不突兀）" else "底板透明度：${(st.bgAlpha * 100 / 255)}% 柔光胶囊",
-                    color = Color.White,
-                    fontSize = 13.sp
-                )
-                Slider(
-                    value = st.bgAlpha.toFloat(),
-                    onValueChange = { v -> AppStateBus.updateStyle(ctx) { it.copy(bgAlpha = v.toInt()) } },
-                    valueRange = 0f..210f
-                )
-
-                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-                    Text("长句字号智能自适应缩放", color = Color.White, modifier = Modifier.weight(1f))
-                    Switch(
-                        checked = st.autoScaleFont,
-                        onCheckedChange = { c -> AppStateBus.updateStyle(ctx) { it.copy(autoScaleFont = c) } }
+        CleanCard {
+            Text("预设主题", color = TextMain, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                MOBILE_LYRICS_PRESETS.forEach { preset ->
+                    FilterChip(
+                        selected = st.presetKey == preset.key,
+                        onClick = { AppStateBus.applyPreset(ctx, preset) },
+                        label = { Text(preset.title, fontSize = 12.sp) }
                     )
                 }
+            }
 
-                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-                    Text("双语歌词对照显示（译文+原文）", color = Color.White, modifier = Modifier.weight(1f))
-                    Switch(
-                        checked = st.bilingual,
-                        onCheckedChange = { c -> AppStateBus.updateStyle(ctx) { it.copy(bilingual = c) } }
-                    )
-                }
+            Text("文字大小：${st.baseFontSp.toInt()} sp", color = TextMain, fontSize = 13.sp)
+            Slider(
+                value = st.baseFontSp,
+                onValueChange = { v -> AppStateBus.updateStyle(ctx) { it.copy(baseFontSp = v) } },
+                valueRange = 14f..36f
+            )
+
+            Text("描边粗细：${"%.1f".format(st.strokeWidthDp)} dp", color = TextMain, fontSize = 13.sp)
+            Slider(
+                value = st.strokeWidthDp,
+                onValueChange = { v -> AppStateBus.updateStyle(ctx) { it.copy(strokeWidthDp = v) } },
+                valueRange = 0f..6f
+            )
+
+            Text(
+                text = if (st.bgAlpha == 0) "底板透明：全透明" else "底板透明：${(st.bgAlpha * 100 / 255)}%",
+                color = TextMain,
+                fontSize = 13.sp
+            )
+            Slider(
+                value = st.bgAlpha.toFloat(),
+                onValueChange = { v -> AppStateBus.updateStyle(ctx) { it.copy(bgAlpha = v.toInt()) } },
+                valueRange = 0f..200f
+            )
+
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                Text("长句自动缩放字号", color = TextMain, modifier = Modifier.weight(1f), fontSize = 13.5.sp)
+                Switch(
+                    checked = st.autoScaleFont,
+                    onCheckedChange = { c -> AppStateBus.updateStyle(ctx) { it.copy(autoScaleFont = c) } }
+                )
+            }
+
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                Text("显示双语对照", color = TextMain, modifier = Modifier.weight(1f), fontSize = 13.5.sp)
+                Switch(
+                    checked = st.bilingual,
+                    onCheckedChange = { c -> AppStateBus.updateStyle(ctx) { it.copy(bilingual = c) } }
+                )
+            }
+
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                Text("6 秒无新台词自动隐藏字幕", color = TextMain, modifier = Modifier.weight(1f), fontSize = 13.5.sp)
+                Switch(
+                    checked = st.autoHideSeconds > 0,
+                    onCheckedChange = { c -> AppStateBus.updateStyle(ctx) { it.copy(autoHideSeconds = if (c) 6 else 0) } }
+                )
             }
         }
     }
 }
 
 @Composable
-private fun EditAndGlossaryTab(cardBg: Color, accentPink: Color) {
+private fun EditAndGlossaryTab() {
     val ctx = LocalContext.current
     val curOrig by AppStateBus.currentOriginal.collectAsState()
     val curTrans by AppStateBus.currentTranslated.collectAsState()
@@ -388,86 +391,85 @@ private fun EditAndGlossaryTab(cardBg: Color, accentPink: Color) {
         modifier = Modifier
             .fillMaxSize()
             .verticalScroll(rememberScrollState()),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
+        verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
-        Card(colors = CardDefaults.cardColors(containerColor = cardBg), shape = RoundedCornerShape(16.dp)) {
-            Column(Modifier.padding(15.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("✏️ 直接修改当前悬浮字幕文字", color = Color(0xFFFFD2E8), fontWeight = FontWeight.Bold)
-                OutlinedTextField(
-                    value = editTrans,
-                    onValueChange = { editTrans = it },
-                    label = { Text("当前中文译文") },
-                    modifier = Modifier.fillMaxWidth()
-                )
-                Button(
-                    onClick = { AppStateBus.editCurrentSubtitle(curOrig, editTrans) },
-                    colors = ButtonDefaults.buttonColors(containerColor = accentPink),
-                    modifier = Modifier.align(Alignment.End)
-                ) {
-                    Text("立即更新到悬浮歌词")
-                }
+        CleanCard {
+            Text("修改当前译文", color = TextMain, fontWeight = FontWeight.Bold, fontSize = 15.sp)
+            OutlinedTextField(
+                value = editTrans,
+                onValueChange = { editTrans = it },
+                label = { Text("中文译文") },
+                modifier = Modifier.fillMaxWidth()
+            )
+            Button(
+                onClick = { AppStateBus.editCurrentSubtitle(curOrig, editTrans) },
+                colors = ButtonDefaults.buttonColors(containerColor = PrimaryBlue),
+                shape = RoundedCornerShape(9.dp),
+                modifier = Modifier.align(Alignment.End)
+            ) {
+                Text("应用修改")
             }
         }
 
-        Card(colors = CardDefaults.cardColors(containerColor = cardBg), shape = RoundedCornerShape(16.dp)) {
-            Column(Modifier.padding(15.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("📖 番剧专属人名 / 术语记忆表", color = Color(0xFF8CE4FF), fontWeight = FontWeight.Bold)
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                    OutlinedTextField(
-                        value = newSrc,
-                        onValueChange = { newSrc = it },
-                        label = { Text("外语原词") },
-                        modifier = Modifier.weight(1f)
-                    )
-                    OutlinedTextField(
-                        value = newDst,
-                        onValueChange = { newDst = it },
-                        label = { Text("指定译名") },
-                        modifier = Modifier.weight(1f)
-                    )
-                }
-                Button(
-                    onClick = {
-                        if (newSrc.isNotBlank() && newDst.isNotBlank()) {
-                            AppStateBus.putGlossaryTerm(ctx, newSrc, newDst)
-                            MobileTranslator.clearCache()
-                            newSrc = ""
-                            newDst = ""
-                        }
-                    },
-                    colors = ButtonDefaults.buttonColors(containerColor = accentPink),
-                    modifier = Modifier.align(Alignment.End)
-                ) {
-                    Text("➕ 添加术语记忆")
-                }
-
-                glossary.entries.forEach { (k, v) ->
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .background(Color(0xFF131726), RoundedCornerShape(8.dp))
-                            .padding(horizontal = 10.dp, vertical = 6.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text("$k  ➔  $v", color = Color.White, modifier = Modifier.weight(1f), fontSize = 13.sp)
-                        Text(
-                            text = "删除",
-                            color = Color(0xFFFF7B9C),
-                            fontSize = 12.sp,
-                            modifier = Modifier.clickable {
-                                AppStateBus.removeGlossaryTerm(ctx, k)
-                                MobileTranslator.clearCache()
-                            }
-                        )
+        CleanCard {
+            Text("专有名词词表", color = TextMain, fontWeight = FontWeight.Bold, fontSize = 15.sp)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(
+                    value = newSrc,
+                    onValueChange = { newSrc = it },
+                    label = { Text("外语原词") },
+                    modifier = Modifier.weight(1f)
+                )
+                OutlinedTextField(
+                    value = newDst,
+                    onValueChange = { newDst = it },
+                    label = { Text("固定译名") },
+                    modifier = Modifier.weight(1f)
+                )
+            }
+            Button(
+                onClick = {
+                    if (newSrc.isNotBlank() && newDst.isNotBlank()) {
+                        AppStateBus.putGlossaryTerm(ctx, newSrc, newDst)
+                        MobileTranslator.clearCache()
+                        newSrc = ""
+                        newDst = ""
                     }
+                },
+                colors = ButtonDefaults.buttonColors(containerColor = PrimaryBlue),
+                shape = RoundedCornerShape(9.dp),
+                modifier = Modifier.align(Alignment.End)
+            ) {
+                Text("添加词条")
+            }
+
+            glossary.entries.forEach { (k, v) ->
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(Color(0xFFF8FAFC), RoundedCornerShape(8.dp))
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("$k  →  $v", color = TextMain, modifier = Modifier.weight(1f), fontSize = 13.sp)
+                    Text(
+                        text = "删除",
+                        color = StopRedText,
+                        fontSize = 12.sp,
+                        modifier = Modifier.clickable {
+                            AppStateBus.removeGlossaryTerm(ctx, k)
+                            MobileTranslator.clearCache()
+                        }
+                    )
                 }
             }
         }
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun EngineSettingsTab(cardBg: Color, accentPink: Color) {
+private fun EngineSettingsTab() {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     val cfg by AppStateBus.engineConfig.collectAsState()
@@ -482,85 +484,86 @@ private fun EngineSettingsTab(cardBg: Color, accentPink: Color) {
         modifier = Modifier
             .fillMaxSize()
             .verticalScroll(rememberScrollState()),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
+        verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
-        Card(colors = CardDefaults.cardColors(containerColor = cardBg), shape = RoundedCornerShape(16.dp)) {
-            Column(Modifier.padding(15.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("⚡ 选择翻译引擎通道", color = Color(0xFFFFD2E8), fontWeight = FontWeight.Bold)
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf(
-                        "auto_free" to "免配置免费极速",
-                        "deepseek" to "DeepSeek大模型",
-                        "pc_lan" to "联动电脑端引擎"
-                    ).forEach { (code, label) ->
-                        FilterChip(
-                            selected = cfg.transEngine == code,
-                            onClick = { AppStateBus.updateEngineConfig(ctx) { it.copy(transEngine = code) } },
-                            label = { Text(label, fontSize = 11.5.sp) }
-                        )
-                    }
+        CleanCard {
+            Text("翻译引擎", color = TextMain, fontWeight = FontWeight.Bold, fontSize = 15.sp)
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                listOf(
+                    "auto_free" to "自动竞速（推荐）",
+                    "cn_direct" to "国内直连免代理",
+                    "deepseek" to "DeepSeek 大模型",
+                    "pc_lan" to "联动电脑端"
+                ).forEach { (code, label) ->
+                    FilterChip(
+                        selected = cfg.transEngine == code,
+                        onClick = { AppStateBus.updateEngineConfig(ctx) { it.copy(transEngine = code) } },
+                        label = { Text(label, fontSize = 12.sp) }
+                    )
                 }
+            }
 
-                OutlinedTextField(
-                    value = apiBase,
-                    onValueChange = { apiBase = it },
-                    label = { Text("大模型 API Base URL") },
-                    modifier = Modifier.fillMaxWidth()
-                )
-                OutlinedTextField(
-                    value = apiKey,
-                    onValueChange = { apiKey = it },
-                    label = { Text("DeepSeek / OpenAI API Key（选填）") },
-                    modifier = Modifier.fillMaxWidth()
-                )
-                OutlinedTextField(
-                    value = modelName,
-                    onValueChange = { modelName = it },
-                    label = { Text("模型名称（如 deepseek-chat）") },
-                    modifier = Modifier.fillMaxWidth()
-                )
-                OutlinedTextField(
-                    value = pcLan,
-                    onValueChange = { pcLan = it },
-                    label = { Text("电脑端局域网桥接地址（如 http://192.168.1.8:18765）") },
-                    modifier = Modifier.fillMaxWidth()
-                )
+            OutlinedTextField(
+                value = apiBase,
+                onValueChange = { apiBase = it },
+                label = { Text("大模型接口地址") },
+                modifier = Modifier.fillMaxWidth()
+            )
+            OutlinedTextField(
+                value = apiKey,
+                onValueChange = { apiKey = it },
+                label = { Text("API Key（选填）") },
+                modifier = Modifier.fillMaxWidth()
+            )
+            OutlinedTextField(
+                value = modelName,
+                onValueChange = { modelName = it },
+                label = { Text("模型名称") },
+                modifier = Modifier.fillMaxWidth()
+            )
+            OutlinedTextField(
+                value = pcLan,
+                onValueChange = { pcLan = it },
+                label = { Text("电脑端局域网地址（如 http://192.168.1.8:18765）") },
+                modifier = Modifier.fillMaxWidth()
+            )
 
-                if (syncMsg.isNotBlank()) {
-                    Text(syncMsg, color = Color(0xFF8CE4FF), fontSize = 12.sp)
+            if (syncMsg.isNotBlank()) {
+                Text(syncMsg, color = PrimaryBlue, fontSize = 12.sp)
+            }
+
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+                OutlinedButton(
+                    onClick = {
+                        scope.launch {
+                            val n = runCatching { MobileTranslator.syncGlossaryFromPcLan(pcLan) }.getOrDefault(-1)
+                            syncMsg = if (n >= 0) "连接成功，已读取电脑端 $n 条词表" else "无法连接电脑端，请确认处于同一 Wi-Fi"
+                        }
+                    },
+                    shape = RoundedCornerShape(9.dp),
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text("测试电脑连接")
                 }
-
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                    OutlinedButton(
-                        onClick = {
-                            scope.launch {
-                                val n = runCatching { MobileTranslator.syncGlossaryFromPcLan(pcLan) }.getOrDefault(-1)
-                                syncMsg = if (n >= 0) "✅ 已成功连接电脑端（检测到 $n 条番剧术语）" else "⚠️ 无法连接电脑端，请检查同一 Wi-Fi 与地址"
-                            }
-                        },
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Text("测试连接电脑端")
-                    }
-                    Button(
-                        onClick = {
-                            AppStateBus.updateEngineConfig(ctx) {
-                                it.copy(
-                                    llmApiBase = apiBase.trim(),
-                                    llmApiKey = apiKey.trim(),
-                                    llmModel = modelName.trim(),
-                                    pcLanUrl = pcLan.trim(),
-                                    transEngine = if (apiKey.isNotBlank() && it.transEngine == "auto_free") "deepseek" else it.transEngine
-                                )
-                            }
-                            MobileTranslator.clearCache()
-                            syncMsg = "✅ 引擎设置已保存！"
-                        },
-                        colors = ButtonDefaults.buttonColors(containerColor = accentPink),
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Text("💾 保存设置")
-                    }
+                Button(
+                    onClick = {
+                        AppStateBus.updateEngineConfig(ctx) {
+                            it.copy(
+                                llmApiBase = apiBase.trim(),
+                                llmApiKey = apiKey.trim(),
+                                llmModel = modelName.trim(),
+                                pcLanUrl = pcLan.trim(),
+                                transEngine = if (apiKey.isNotBlank() && it.transEngine == "auto_free") "deepseek" else it.transEngine
+                            )
+                        }
+                        MobileTranslator.clearCache()
+                        syncMsg = "设置已保存"
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = PrimaryBlue),
+                    shape = RoundedCornerShape(9.dp),
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text("保存设置")
                 }
             }
         }

@@ -4,16 +4,26 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import queue
+import re
+import tarfile
 import threading
 import time
 import urllib.request
 import wave
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 
-from .config import ConfigManager
+from .config import DATA_DIR, ConfigManager
+
+SENSEVOICE_DIR_NAME = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"
+SENSEVOICE_URLS = [
+    "https://ghfast.top/https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2",
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2",
+]
 
 
 class AudioDeviceInfo:
@@ -48,6 +58,7 @@ class RealtimeAudioEngine:
         self._whisper_model: Any = None
         self._whisper_loaded_name: str = ""
         self._whisper_device: str = "cpu"
+        self._sensevoice_rec: Any = None
         self._model_lock = threading.Lock()
 
     @staticmethod
@@ -145,7 +156,7 @@ class RealtimeAudioEngine:
         try:
             dev = self._resolve_target_device(p)
             if not dev:
-                self._emit_status("⚠️ 未检测到可用的音频输入/内录设备")
+                self._emit_status("未检测到可用的音频输入或内录设备")
                 self._running = False
                 return
 
@@ -234,7 +245,7 @@ class RealtimeAudioEngine:
                     speech_sec = 0.0
 
         except Exception as exc:
-            self._emit_status(f"⚠️ 音频捕获异常: {exc}")
+            self._emit_status(f"音频捕获异常: {exc}")
             self._running = False
         finally:
             if stream is not None:
@@ -262,7 +273,8 @@ class RealtimeAudioEngine:
     def _ensure_whisper(self, force_cpu: bool = False) -> Any:
         from faster_whisper import WhisperModel
 
-        model_name = self.cfg_mgr.config.whisper_model.strip() or "tiny"
+        raw_name = self.cfg_mgr.config.whisper_model.strip() or "tiny"
+        model_name = "tiny" if raw_name == "sensevoice" else raw_name
         with self._model_lock:
             if (
                 self._whisper_model is not None
@@ -313,7 +325,72 @@ class RealtimeAudioEngine:
             if clean and not self._is_hallucination(clean):
                 self.on_transcript(source_tag, clean)
 
+    def _ensure_sensevoice(self) -> Any:
+        """Loads SenseVoiceSmall (int8 ONNX via sherpa-onnx), auto-downloading once if absent."""
+        with self._model_lock:
+            if self._sensevoice_rec is not None:
+                return self._sensevoice_rec
+            import sherpa_onnx
+
+            model_root = DATA_DIR / "models" / SENSEVOICE_DIR_NAME
+            model_file = model_root / "model.int8.onnx"
+            tokens_file = model_root / "tokens.txt"
+
+            if not (model_file.exists() and tokens_file.exists()):
+                models_dir = DATA_DIR / "models"
+                models_dir.mkdir(parents=True, exist_ok=True)
+                archive_path = models_dir / f"{SENSEVOICE_DIR_NAME}.tar.bz2"
+                downloaded = False
+                for url in SENSEVOICE_URLS:
+                    try:
+                        self._emit_status("首次使用 SenseVoice，正在下载动漫多语种语音模型 (~150MB)...")
+                        req = urllib.request.Request(url, headers={"User-Agent": "QingYi/1.2"})
+                        with urllib.request.urlopen(req, timeout=30) as resp, open(archive_path, "wb") as out_f:
+                            while True:
+                                chunk = resp.read(262144)
+                                if not chunk:
+                                    break
+                                out_f.write(chunk)
+                        self._emit_status("正在解压 SenseVoice 模型...")
+                        with tarfile.open(archive_path, "r:bz2") as tf:
+                            tf.extractall(models_dir)
+                        archive_path.unlink(missing_ok=True)
+                        downloaded = model_file.exists() and tokens_file.exists()
+                        if downloaded:
+                            break
+                    except Exception:
+                        archive_path.unlink(missing_ok=True)
+                if not downloaded:
+                    raise RuntimeError("SenseVoice 模型下载失败，自动切换为 Whisper 引擎")
+
+            cores = os.cpu_count() or 8
+            self._sensevoice_rec = sherpa_onnx.OfflineRecognizer.from_sense_voice(
+                model=str(model_file),
+                tokens=str(tokens_file),
+                num_threads=min(4, max(2, cores // 4)),
+                use_itn=True,
+                debug=False,
+            )
+            self._emit_status("SenseVoice 动漫高准语音引擎已就绪")
+            return self._sensevoice_rec
+
+    def _transcribe_sensevoice(self, audio_16k: np.ndarray) -> str:
+        rec = self._ensure_sensevoice()
+        stream = rec.create_stream()
+        stream.accept_waveform(16000, audio_16k)
+        rec.decode_stream(stream)
+        raw = str(stream.result.text or "").strip()
+        # Strip SenseVoice meta tags like <|ja|><|NEUTRAL|><|Speech|><|woitn|>
+        clean = re.sub(r"<\|[^|]+\|>", "", raw).strip()
+        return clean
+
     def _transcribe_local(self, audio_16k: np.ndarray, lang_hint: Optional[str]) -> str:
+        if self.cfg_mgr.config.whisper_model.strip() == "sensevoice":
+            try:
+                return self._transcribe_sensevoice(audio_16k)
+            except Exception as exc:
+                self._emit_status(f"{exc}")
+
         try:
             model = self._ensure_whisper(force_cpu=False)
             segments, _ = model.transcribe(
@@ -337,7 +414,7 @@ class RealtimeAudioEngine:
                 )
                 return " ".join(s.text.strip() for s in segments if s.text.strip()).strip()
             except Exception as exc:
-                self._emit_status(f"⚠️ 语音识别错误: {exc}")
+                self._emit_status(f"语音识别错误: {exc}")
                 return ""
 
     def _transcribe_cloud(self, audio_16k: np.ndarray, lang_hint: Optional[str]) -> str:

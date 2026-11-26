@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import threading
 import time
+import urllib.request
+import webbrowser
 from typing import Optional
 
 from PySide6.QtCore import QObject, QRect, Qt, QTimer, Signal
@@ -36,6 +39,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from . import GITHUB_REPO, __version__
 from .audio_engine import RealtimeAudioEngine
 from .config import ConfigManager, SubtitleEntry
 from .lan_server import LanBridgeServer, get_local_lan_ip
@@ -82,6 +86,8 @@ class WorkerBridge(QObject):
     audio_level = Signal(float)
     status_message = Signal(str)
     devices_loaded = Signal(object)
+    empty_screen = Signal()
+    update_checked = Signal(str, str)  # (latest_tag, release_url)
 
 
 class MainWindow(QMainWindow):
@@ -96,6 +102,8 @@ class MainWindow(QMainWindow):
 
         self._live_screen_running = False
         self._ocr_busy = False
+        self._force_quit = False
+        self._tray_notified = False
         self._current_entry_id: str = ""
         self._active_selector: Optional[RegionSelectorOverlay] = None
         self._active_snip_card: Optional[SnipResultCard] = None
@@ -156,6 +164,8 @@ class MainWindow(QMainWindow):
         self.bridge.audio_level.connect(self._update_audio_meter)
         self.bridge.status_message.connect(self._set_status)
         self.bridge.devices_loaded.connect(self._apply_loaded_audio_devices)
+        self.bridge.empty_screen.connect(self.lyrics_win.clear_for_empty_scene)
+        self.bridge.update_checked.connect(self._on_update_checked)
 
         self.screen_timer = QTimer(self)
         self.screen_timer.timeout.connect(self._poll_screen_region)
@@ -787,7 +797,9 @@ class MainWindow(QMainWindow):
 
         g1.addWidget(QLabel("翻译引擎"), 0, 0)
         self.engine_quick_combo = QComboBox()
-        self.engine_quick_combo.addItem("内置免费翻译（免配置开箱即用）", "auto_free")
+        self.engine_quick_combo.addItem("自动极速竞速（推荐·免配置）", "auto_free")
+        self.engine_quick_combo.addItem("国内直连免代理（有道 + MyMemory）", "cn_direct")
+        self.engine_quick_combo.addItem("Google 极速优先", "google_first")
         self.engine_quick_combo.addItem("DeepSeek / 大模型接口", "deepseek")
         idx_e = self.engine_quick_combo.findData(self.cfg_mgr.config.trans_engine)
         if idx_e >= 0:
@@ -824,9 +836,10 @@ class MainWindow(QMainWindow):
         g2.addWidget(QLabel("语音模型"), 1, 0)
         self.combo_whisper = QComboBox()
         for label, m in [
-            ("轻量极速 (tiny)", "tiny"),
-            ("均衡标准 (base)", "base"),
-            ("高准确度 (small)", "small"),
+            ("SenseVoiceSmall（动漫日/英/韩高准·首次自动下载）", "sensevoice"),
+            ("Whisper 轻量极速 (tiny)", "tiny"),
+            ("Whisper 均衡标准 (base)", "base"),
+            ("Whisper 高准确度 (small)", "small"),
         ]:
             self.combo_whisper.addItem(label, m)
         w_idx = self.combo_whisper.findData(self.cfg_mgr.config.whisper_model)
@@ -854,21 +867,58 @@ class MainWindow(QMainWindow):
         self.combo_interval.currentIndexChanged.connect(
             lambda: self._on_interval_changed(int(self.combo_interval.currentData() or 220))
         )
-        self.chk_show_border = QCheckBox("监控时显示区域四角辅助标")
+        self.chk_show_border = QCheckBox("显示区域四角辅助标")
         self.chk_show_border.setChecked(self.cfg_mgr.config.show_region_border)
         self.chk_show_border.toggled.connect(self._on_region_border_toggled)
+        self.chk_stabilize = QCheckBox("双帧防抖")
+        self.chk_stabilize.setChecked(self.cfg_mgr.config.ocr_stabilize)
         sp_row.addWidget(self.combo_interval)
-        sp_row.addSpacing(14)
+        sp_row.addSpacing(12)
         sp_row.addWidget(self.chk_show_border)
+        sp_row.addSpacing(10)
+        sp_row.addWidget(self.chk_stabilize)
         sp_row.addStretch()
         g2.addLayout(sp_row, 2, 1)
 
+        g2.addWidget(QLabel("看番体验"), 3, 0)
+        ux_row = QHBoxLayout()
+        self.combo_autohide = QComboBox()
+        for lbl_h, sec_v in [
+            ("6 秒无台词自动隐身（推荐）", 6),
+            ("4 秒无台词自动隐身", 4),
+            ("10 秒无台词自动隐身", 10),
+            ("不自动隐藏字幕", 0),
+        ]:
+            self.combo_autohide.addItem(lbl_h, sec_v)
+        ah_idx = self.combo_autohide.findData(int(self.cfg_mgr.config.auto_hide_seconds))
+        if ah_idx >= 0:
+            self.combo_autohide.setCurrentIndex(ah_idx)
+        self.chk_tray_close = QCheckBox("点关闭按钮时最小化到托盘")
+        self.chk_tray_close.setChecked(self.cfg_mgr.config.minimize_to_tray_on_close)
+        ux_row.addWidget(self.combo_autohide)
+        ux_row.addSpacing(12)
+        ux_row.addWidget(self.chk_tray_close)
+        ux_row.addStretch()
+        g2.addLayout(ux_row, 3, 1)
+
         lan_ip = get_local_lan_ip()
         port = self.cfg_mgr.config.lan_server_port
-        g2.addWidget(QLabel("手机联动"), 3, 0)
+        g2.addWidget(QLabel("手机联动"), 4, 0)
         lan_lbl = QLabel(f"局域网地址  http://{lan_ip}:{port}")
         lan_lbl.setProperty("role", "caption")
-        g2.addWidget(lan_lbl, 3, 1)
+        g2.addWidget(lan_lbl, 4, 1)
+
+        g2.addWidget(QLabel("软件版本"), 5, 0)
+        ver_row = QHBoxLayout()
+        ver_lbl = QLabel(f"轻译 v{__version__}")
+        ver_lbl.setProperty("role", "caption")
+        self.btn_check_upd = QPushButton("检查新版本")
+        self.btn_check_upd.clicked.connect(self._check_github_update)
+        ver_row.addWidget(ver_lbl)
+        ver_row.addSpacing(12)
+        ver_row.addWidget(self.btn_check_upd)
+        ver_row.addStretch()
+        g2.addLayout(ver_row, 5, 1)
         lay.addWidget(card_hw)
 
         btn_save = QPushButton("保存设置")
@@ -889,8 +939,8 @@ class MainWindow(QMainWindow):
         act_snip.triggered.connect(lambda: self.start_region_selection("snip"))
         act_unlock = QAction("锁定 / 解锁字幕穿透", self)
         act_unlock.triggered.connect(self._toggle_lock_overlay)
-        act_quit = QAction("退出", self)
-        act_quit.triggered.connect(QApplication.instance().quit)
+        act_quit = QAction("退出轻译", self)
+        act_quit.triggered.connect(self.quit_application)
         for a in (act_show, act_snip, act_unlock, act_quit):
             menu.addAction(a)
         self.tray.setContextMenu(menu)
@@ -1112,7 +1162,12 @@ class MainWindow(QMainWindow):
     def _process_live_frame_bg(self, bgr) -> None:
         try:
             orig = self.ocr_engine.recognize_image(bgr, self.cfg_mgr.config.target_lang)
-            if orig and self.ocr_engine.check_is_new_subtitle(orig):
+            if not orig:
+                empty_cnt = self.ocr_engine.record_empty_frame()
+                if empty_cnt == 3:
+                    self.bridge.empty_screen.emit()
+                return
+            if self.ocr_engine.check_is_new_subtitle(orig, stabilize=self.cfg_mgr.config.ocr_stabilize):
                 trans = self.translator.translate(orig)
                 self.bridge.subtitle_ready.emit("屏幕", orig, trans)
         finally:
@@ -1295,12 +1350,52 @@ class MainWindow(QMainWindow):
         cfg.llm_api_key = self.ed_api_key.text().strip()
         cfg.llm_model = self.ed_llm_model.text().strip() or "deepseek-chat"
         cfg.whisper_model = str(self.combo_whisper.currentData() or "tiny")
+        cfg.ocr_stabilize = self.chk_stabilize.isChecked()
+        cfg.auto_hide_seconds = int(self.combo_autohide.currentData() or 0)
+        cfg.minimize_to_tray_on_close = self.chk_tray_close.isChecked()
         if cfg.llm_api_key and cfg.trans_engine == "auto_free":
             cfg.trans_engine = "deepseek"
-            self.engine_quick_combo.setCurrentIndex(1)
+            idx_ds = self.engine_quick_combo.findData("deepseek")
+            if idx_ds >= 0:
+                self.engine_quick_combo.setCurrentIndex(idx_ds)
         self.cfg_mgr.save()
         self.translator.clear_cache()
         self._set_status("偏好设置已保存")
+
+    def _check_github_update(self) -> None:
+        self.btn_check_upd.setEnabled(False)
+        self.btn_check_upd.setText("检查中...")
+
+        def fetch() -> None:
+            try:
+                url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+                req = urllib.request.Request(url, headers={"User-Agent": f"QingYi/{__version__}"})
+                data = json.loads(urllib.request.urlopen(req, timeout=6).read().decode("utf-8"))
+                tag = str(data.get("tag_name", "")).strip()
+                html_url = str(data.get("html_url", f"https://github.com/{GITHUB_REPO}/releases"))
+                self.bridge.update_checked.emit(tag, html_url)
+            except Exception:
+                self.bridge.update_checked.emit("ERROR", "")
+
+        threading.Thread(target=fetch, daemon=True).start()
+
+    def _on_update_checked(self, latest_tag: str, html_url: str) -> None:
+        self.btn_check_upd.setEnabled(True)
+        self.btn_check_upd.setText("检查新版本")
+        if latest_tag == "ERROR" or not latest_tag:
+            QMessageBox.information(self, "检查更新", "连接 GitHub 失败，请稍后重试。")
+            return
+        cur_v = f"v{__version__}"
+        if latest_tag != cur_v and latest_tag > cur_v:
+            reply = QMessageBox.question(
+                self,
+                "发现新版本",
+                f"当前版本：{cur_v}\n最新版本：{latest_tag}\n\n是否立即前往 GitHub 下载更新？",
+            )
+            if reply == QMessageBox.StandardButton.Yes and html_url:
+                webbrowser.open(html_url)
+        else:
+            QMessageBox.information(self, "检查更新", f"当前已是最新版本（{cur_v}）。")
 
     def _get_latest_sub_dict(self) -> dict:
         o, t = self.lyrics_win.current_subtitle()
@@ -1310,7 +1405,25 @@ class MainWindow(QMainWindow):
         clean = (text or "").lstrip("🎧📺✂️✨✅⚠️⏳⏹️⏸️💡 ").strip()
         self.status_lbl.setText(clean)
 
+    def quit_application(self) -> None:
+        self._force_quit = True
+        self.close()
+        QApplication.instance().quit()
+
     def closeEvent(self, event) -> None:
+        if not self._force_quit and self.cfg_mgr.config.minimize_to_tray_on_close and self.tray.isVisible():
+            event.ignore()
+            self.hide()
+            if not self._tray_notified:
+                self._tray_notified = True
+                self.tray.showMessage(
+                    "轻译仍在后台运行",
+                    "悬浮字幕与工具条已保留，双击右下角托盘图标可重新打开主面板。",
+                    QSystemTrayIcon.MessageIcon.Information,
+                    2600,
+                )
+            return
+
         self.screen_timer.stop()
         self.audio_engine.stop()
         self.lan_server.stop()

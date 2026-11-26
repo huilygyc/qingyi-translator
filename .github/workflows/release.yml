@@ -1,0 +1,87 @@
+name: Build & Publish Releases
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies & warm up OCR models
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install PySide6 rapidocr onnxruntime faster-whisper PyAudioWPatch mss opencv-python pillow pyinstaller
+          python -c "import numpy as np; from rapidocr import RapidOCR; eng = RapidOCR(); eng(np.zeros((80, 240, 3), dtype=np.uint8))"
+
+      - name: Package Standalone Windows EXE
+        shell: pwsh
+        working-directory: desktop
+        run: |
+          pyinstaller --noconfirm --clean --onedir --noconsole `
+            --name "轻译" `
+            --icon "assets\anilingo.ico" `
+            --distpath "dist_win" `
+            --collect-data rapidocr `
+            --collect-data faster_whisper `
+            --collect-binaries onnxruntime `
+            --collect-binaries ctranslate2 `
+            --hidden-import rapidocr `
+            --hidden-import faster_whisper `
+            --hidden-import pyaudiowpatch `
+            --hidden-import mss `
+            --hidden-import cv2 `
+            run_desktop.py
+          Compress-Archive -Path "dist_win\轻译" -DestinationPath "..\QingYi-Windows-x64.zip" -Force
+
+      - name: Upload Windows Release Asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "轻译 ${{ github.ref_name }}（Windows 便携版 EXE + Android 悬浮窗 APK）"
+          body: |
+            ### 下载安装说明
+            1. **Windows 电脑免安装便携版 (`QingYi-Windows-x64.zip`)**：下载解压后双击 `轻译/轻译.exe` 即可打开浅色控制面板使用。
+            2. **Android 手机全局悬浮窗版 (`QingYi-Android.apk`)**：下载安装至 Android 手机，开启悬浮窗权限即可使用。
+          files: QingYi-Windows-x64.zip
+
+  build-android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Build Android APK
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+          cp app/build/outputs/apk/debug/app-debug.apk ../QingYi-Android.apk
+
+      - name: Upload Android Release Asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "轻译 ${{ github.ref_name }}（Windows 便携版 EXE + Android 悬浮窗 APK）"
+          files: QingYi-Android.apk

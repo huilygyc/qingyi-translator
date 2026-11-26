@@ -1,0 +1,21 @@
+# Compiled binaries & release archives (published via GitHub Releases)
+release/
+*.exe
+*.apk
+*.zip
+
+# Python cache & local runtime data
+__pycache__/
+*.py[cod]
+desktop/build_exe/
+desktop/dist/
+desktop/data/config.json
+desktop/data/history.json
+
+# Android Gradle build outputs & local SDK path
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.idea/
+*.iml

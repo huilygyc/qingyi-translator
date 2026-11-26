@@ -2,6 +2,7 @@
 release/
 *.exe
 *.apk
+!downloads/*.apk
 *.zip
 
 # Python cache & local runtime data

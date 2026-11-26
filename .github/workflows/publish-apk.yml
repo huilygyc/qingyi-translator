@@ -1,0 +1,26 @@
+name: Attach Android APK to Release
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "downloads/QingYi-Android.apk"
+      - ".github/workflows/publish-apk.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  attach-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Attach QingYi-Android.apk to v1.0.0 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.0
+          name: "轻译 v1.0.0（Windows 便携版 EXE + Android 悬浮窗 APK）"
+          files: downloads/QingYi-Android.apk

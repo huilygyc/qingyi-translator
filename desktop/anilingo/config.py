@@ -179,7 +179,7 @@ class AppConfig:
 
     # Screen region capture settings
     capture_region: List[int] = field(default_factory=lambda: [360, 780, 1200, 180])  # [x, y, w, h]
-    region_interval_ms: int = 450
+    region_interval_ms: int = 220
     show_region_border: bool = True
 
     # Audio capture & ASR settings

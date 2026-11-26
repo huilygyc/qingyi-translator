@@ -214,7 +214,7 @@ class RealtimeAudioEngine:
                         speech_chunks.append(samples_16k)
                         speech_sec += chunk_dur
                         silence_sec += chunk_dur
-                        if silence_sec >= 0.45:
+                        if silence_sec >= 0.32:
                             self._flush_segment(speech_chunks, speech_sec)
                             speech_chunks = []
                             speaking = False
@@ -225,8 +225,8 @@ class RealtimeAudioEngine:
                         if len(preroll_chunks) > 4:
                             preroll_chunks.pop(0)
 
-                # Cap continuous rapid anime dialogue at 5.2s so subtitles appear promptly
-                if speaking and speech_sec >= 5.2:
+                # Cap continuous rapid anime dialogue at 3.8s so subtitles appear promptly
+                if speaking and speech_sec >= 3.8:
                     self._flush_segment(speech_chunks, speech_sec)
                     speech_chunks = []
                     speaking = False
@@ -319,7 +319,7 @@ class RealtimeAudioEngine:
             segments, _ = model.transcribe(
                 audio_16k,
                 language=lang_hint,
-                beam_size=2,
+                beam_size=1,
                 vad_filter=True,
                 condition_on_previous_text=False,
             )
@@ -331,7 +331,7 @@ class RealtimeAudioEngine:
                 segments, _ = model.transcribe(
                     audio_16k,
                     language=lang_hint,
-                    beam_size=2,
+                    beam_size=1,
                     vad_filter=True,
                     condition_on_previous_text=False,
                 )

@@ -178,6 +178,7 @@ class MainWindow(QMainWindow):
                 self.bridge.devices_loaded.emit(devs)
             except Exception:
                 pass
+            threading.Thread(target=self.translator.warmup_connections, daemon=True, name="NetWarmup").start()
             self.ocr_engine.warmup()
 
         threading.Thread(target=bg_init, daemon=True, name="PostShowWarmup").start()
@@ -837,21 +838,21 @@ class MainWindow(QMainWindow):
         sp_row = QHBoxLayout()
         self.combo_interval = QComboBox()
         for lbl_i, ms_val in [
-            ("0.3 秒（极速响应）", 300),
-            ("0.45 秒（标准推荐）", 450),
+            ("0.22 秒（极速低延迟·推荐）", 220),
+            ("0.4 秒（标准）", 400),
             ("0.8 秒（均衡省电）", 800),
             ("1.2 秒（低功耗）", 1200),
         ]:
             self.combo_interval.addItem(lbl_i, ms_val)
         cur_ms = self.cfg_mgr.config.region_interval_ms
-        best_idx = 1
+        best_idx = 0
         for i in range(self.combo_interval.count()):
             if abs(int(self.combo_interval.itemData(i)) - cur_ms) <= 100:
                 best_idx = i
                 break
         self.combo_interval.setCurrentIndex(best_idx)
         self.combo_interval.currentIndexChanged.connect(
-            lambda: self._on_interval_changed(int(self.combo_interval.currentData() or 450))
+            lambda: self._on_interval_changed(int(self.combo_interval.currentData() or 220))
         )
         self.chk_show_border = QCheckBox("监控时显示区域四角辅助标")
         self.chk_show_border.setChecked(self.cfg_mgr.config.show_region_border)

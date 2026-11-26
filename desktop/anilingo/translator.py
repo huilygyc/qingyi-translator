@@ -1,26 +1,97 @@
-"""Multi-engine Translator with Zero-Config Free Channels, DeepSeek/OpenAI LLM Context, and Anime Glossary."""
+"""Low-Latency Multi-Engine Translator with Persistent HTTPS Keep-Alive Pooling, Adaptive Routing & Anime Glossary."""
 
 from __future__ import annotations
 
+import http.client
 import json
 import re
 import threading
 import urllib.parse
-import urllib.request
 from collections import OrderedDict
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from .config import ConfigManager
 
 
+class _KeepAliveClient:
+    """Thread-safe persistent HTTP/HTTPS connection reusing the TLS socket across subtitle translations (~200ms)."""
+
+    def __init__(self, host: str, use_https: bool = True, port: Optional[int] = None, timeout: float = 2.8) -> None:
+        self.host = host
+        self.use_https = use_https
+        self.port = port
+        self.timeout = timeout
+        self._lock = threading.Lock()
+        self._conn: Optional[http.client.HTTPConnection] = None
+
+    def _get_conn(self) -> http.client.HTTPConnection:
+        if self._conn is None:
+            if self.use_https:
+                self._conn = http.client.HTTPSConnection(self.host, port=self.port, timeout=self.timeout)
+            else:
+                self._conn = http.client.HTTPConnection(self.host, port=self.port, timeout=self.timeout)
+        return self._conn
+
+    def _reset(self) -> None:
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
+
+    def request(self, method: str, path: str, body: Optional[bytes] = None, headers: Optional[Dict[str, str]] = None) -> bytes:
+        req_headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Connection": "keep-alive",
+        }
+        if headers:
+            req_headers.update(headers)
+
+        with self._lock:
+            for attempt in range(2):
+                try:
+                    conn = self._get_conn()
+                    conn.request(method, path, body=body, headers=req_headers)
+                    resp = conn.getresponse()
+                    data = resp.read()
+                    if resp.status >= 400:
+                        raise RuntimeError(f"HTTP {resp.status}")
+                    return data
+                except Exception:
+                    self._reset()
+                    if attempt == 1:
+                        raise
+        return b""
+
+
 class TranslationService:
-    """Translates anime subtitles/speech with glossary enforcement, rolling context, and automatic failover."""
+    """Translates anime subtitles/speech with persistent Keep-Alive pooling, glossary protection & adaptive failover."""
 
     def __init__(self, cfg_mgr: ConfigManager) -> None:
         self.cfg_mgr = cfg_mgr
         self._cache: OrderedDict[str, str] = OrderedDict()
         self._context_window: List[Tuple[str, str]] = []
         self._lock = threading.RLock()
+
+        # Persistent Keep-Alive pools eliminate ~500-700ms TLS handshakes per subtitle line
+        self._clients: Dict[str, _KeepAliveClient] = {
+            "chrome_dict": _KeepAliveClient("clients5.google.com", True, timeout=2.5),
+            "google_gtx": _KeepAliveClient("translate.googleapis.com", True, timeout=2.5),
+            "mymemory": _KeepAliveClient("api.mymemory.translated.net", True, timeout=3.5),
+        }
+        self._llm_clients: Dict[str, _KeepAliveClient] = {}
+        self._channel_order: List[str] = ["chrome_dict", "google_gtx", "mymemory"]
+
+    def warmup_connections(self) -> None:
+        """Pre-establishes the primary TLS socket in background right after startup so subtitle #1 is fast."""
+        try:
+            self._call_free_channel("chrome_dict", "hello", "en", "zh-CN")
+        except Exception:
+            try:
+                self._call_free_channel("google_gtx", "hello", "en", "zh-CN")
+            except Exception:
+                pass
 
     def clear_cache(self) -> None:
         with self._lock:
@@ -39,7 +110,7 @@ class TranslationService:
 
         cfg = self.cfg_mgr.config
         glossary = dict(self.cfg_mgr.glossary)
-        glossary_sig = str( len(glossary) )
+        glossary_sig = str(len(glossary))
         cache_key = f"{cfg.trans_engine}:{cfg.source_lang}->{cfg.target_lang}:{glossary_sig}::{clean}"
 
         if not force_refresh:
@@ -48,7 +119,6 @@ class TranslationService:
                     self._cache.move_to_end(cache_key)
                     return self._cache[cache_key]
 
-        # Direct exact match in glossary
         if clean in glossary:
             return glossary[clean]
 
@@ -79,8 +149,7 @@ class TranslationService:
 
     @staticmethod
     def _normalize_input(text: str) -> str:
-        text = re.sub(r"\s+", " ", text or "").strip()
-        return text
+        return re.sub(r"\s+", " ", text or "").strip()
 
     def _pre_replace_glossary_for_free(self, text: str, glossary: Dict[str, str]) -> Tuple[str, List[Tuple[str, str]]]:
         """Replaces matched glossary source terms with invariant placeholders [#0#] so MT never alters them."""
@@ -115,7 +184,6 @@ class TranslationService:
 
     @staticmethod
     def _post_apply_glossary(original: str, translated: str, glossary: Dict[str, str]) -> str:
-        """Ensures any untranslated source glossary token remaining in output is mapped cleanly."""
         if not translated or not glossary:
             return translated
         out = translated
@@ -124,80 +192,81 @@ class TranslationService:
                 out = out.replace(src, dst)
         return out.strip()
 
+    def _call_free_channel(self, channel: str, prepared: str, sl: str, tl: str) -> str:
+        q = urllib.parse.quote(prepared)
+        if channel == "chrome_dict":
+            raw = self._clients["chrome_dict"].request(
+                "GET", f"/translate_a/t?client=dict-chrome-ex&sl={sl}&tl={tl}&q={q}"
+            )
+            data = json.loads(raw.decode("utf-8"))
+            if isinstance(data, list) and data:
+                first = data[0]
+                if isinstance(first, list) and first:
+                    return str(first[0]).strip()
+                if isinstance(first, str):
+                    return first.strip()
+        elif channel == "google_gtx":
+            raw = self._clients["google_gtx"].request(
+                "GET", f"/translate_a/single?client=gtx&sl={sl}&tl={tl}&dt=t&q={q}"
+            )
+            data = json.loads(raw.decode("utf-8"))
+            if isinstance(data, list) and data and isinstance(data[0], list):
+                joined = "".join(seg[0] for seg in data[0] if seg and seg[0])
+                if joined.strip():
+                    return joined.strip()
+        elif channel == "mymemory":
+            src_mm = sl if sl != "auto" else self._guess_lang(prepared)
+            langpair = urllib.parse.quote(f"{src_mm}|{tl}")
+            raw = self._clients["mymemory"].request("GET", f"/get?q={q}&langpair={langpair}")
+            data = json.loads(raw.decode("utf-8"))
+            t_text = data.get("responseData", {}).get("translatedText", "")
+            if t_text:
+                return str(t_text).strip()
+        return ""
+
     def _translate_via_free_channels(self, text: str, glossary: Dict[str, str]) -> str:
         cfg = self.cfg_mgr.config
         prepared, placeholders = self._pre_replace_glossary_for_free(text, glossary)
         sl = cfg.source_lang if cfg.source_lang != "auto" else "auto"
         tl = cfg.target_lang
 
-        # Channel 1: Google GTX Fast Endpoint (Zero config, supports JP/EN/KO/Auto -> zh-CN)
-        try:
-            q = urllib.parse.quote(prepared)
-            url = (
-                f"https://translate.googleapis.com/translate_a/single"
-                f"?client=gtx&sl={sl}&tl={tl}&dt=t&q={q}"
-            )
-            req = urllib.request.Request(
-                url,
-                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
-            )
-            with urllib.request.urlopen(req, timeout=4.5) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                if isinstance(data, list) and data and isinstance(data[0], list):
-                    joined = "".join(seg[0] for seg in data[0] if seg and seg[0])
-                    if joined.strip():
-                        return self._restore_placeholders(joined.strip(), placeholders)
-        except Exception:
-            pass
+        with self._lock:
+            order = list(self._channel_order)
 
-        # Channel 2: Google dict-chrome-ex Mirror Endpoint
-        try:
-            q = urllib.parse.quote(prepared)
-            url2 = (
-                f"https://clients5.google.com/translate_a/t"
-                f"?client=dict-chrome-ex&sl={sl}&tl={tl}&q={q}"
-            )
-            req2 = urllib.request.Request(
-                url2,
-                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
-            )
-            with urllib.request.urlopen(req2, timeout=4.5) as resp2:
-                data2 = json.loads(resp2.read().decode("utf-8"))
-                if isinstance(data2, list) and data2:
-                    first = data2[0]
-                    if isinstance(first, list) and first:
-                        return self._restore_placeholders(str(first[0]).strip(), placeholders)
-                    if isinstance(first, str):
-                        return self._restore_placeholders(first.strip(), placeholders)
-        except Exception:
-            pass
-
-        # Channel 3: MyMemory Public Translation API Fallback
-        try:
-            src_mm = sl if sl != "auto" else self._guess_lang(text)
-            langpair = urllib.parse.quote(f"{src_mm}|{tl}")
-            q = urllib.parse.quote(prepared)
-            url3 = f"https://api.mymemory.translated.net/get?q={q}&langpair={langpair}"
-            req3 = urllib.request.Request(url3, headers={"User-Agent": "AniLingo/1.0"})
-            with urllib.request.urlopen(req3, timeout=5.0) as resp3:
-                data3 = json.loads(resp3.read().decode("utf-8"))
-                t_text = data3.get("responseData", {}).get("translatedText", "")
-                if t_text:
-                    return self._restore_placeholders(str(t_text).strip(), placeholders)
-        except Exception:
-            pass
+        for idx, ch in enumerate(order):
+            try:
+                res = self._call_free_channel(ch, prepared, sl, tl)
+                if res:
+                    # Promote the winning fast channel to front so subsequent lines avoid slow fallbacks
+                    if idx != 0:
+                        with self._lock:
+                            if ch in self._channel_order:
+                                self._channel_order.remove(ch)
+                                self._channel_order.insert(0, ch)
+                    return self._restore_placeholders(res, placeholders)
+            except Exception:
+                continue
 
         return self._restore_placeholders(prepared, placeholders)
 
     def _translate_via_llm(self, text: str, glossary: Dict[str, str]) -> str:
         cfg = self.cfg_mgr.config
         base = cfg.llm_api_base.rstrip("/")
-        if not base.endswith("/chat/completions"):
-            endpoint = f"{base}/chat/completions"
-        else:
-            endpoint = base
+        endpoint = base if base.endswith("/chat/completions") else f"{base}/chat/completions"
+        parsed = urllib.parse.urlparse(endpoint)
+        host = parsed.hostname or "api.deepseek.com"
+        use_https = parsed.scheme != "http"
+        port = parsed.port
+        path = parsed.path + (f"?{parsed.query}" if parsed.query else "")
 
-        # Filter relevant glossary terms + top custom entries
+        client_key = f"{parsed.scheme}://{host}:{port}"
+        with self._lock:
+            client = self._llm_clients.get(client_key)
+            if client is None:
+                client = _KeepAliveClient(host, use_https=use_https, port=port, timeout=7.5)
+                self._llm_clients[client_key] = client
+            recent = list(self._context_window[-4:])
+
         matched_terms = [f"{k} -> {v}" for k, v in glossary.items() if k.lower() in text.lower()]
         if len(matched_terms) < 20:
             for k, v in list(glossary.items())[:20]:
@@ -205,17 +274,12 @@ class TranslationService:
                 if pair not in matched_terms:
                     matched_terms.append(pair)
 
-        sys_parts = [cfg.llm_anime_prompt.strip()]
-        sys_parts.append(f"目标语言：{cfg.target_lang}。")
+        sys_parts = [cfg.llm_anime_prompt.strip(), f"目标语言：{cfg.target_lang}。"]
         if matched_terms:
-            sys_parts.append("必须严格遵循以下番剧专有名词/人名译法：\n" + "\n".join(matched_terms))
-
-        with self._lock:
-            recent = list(self._context_window[-4:])
-
+            sys_parts.append("必须严格遵循以下专有名词/人名译法：\n" + "\n".join(matched_terms))
         if recent:
             ctx_lines = [f"原文：{o} => 译文：{t}" for o, t in recent]
-            sys_parts.append("前文台词参考（仅用于保持人称与语境连贯，不要重复输出前文）：\n" + "\n".join(ctx_lines))
+            sys_parts.append("前文台词参考（仅保持人称与语境连贯，不要重复输出）：\n" + "\n".join(ctx_lines))
 
         payload = {
             "model": cfg.llm_model.strip() or "deepseek-chat",
@@ -223,35 +287,29 @@ class TranslationService:
                 {"role": "system", "content": "\n\n".join(sys_parts)},
                 {"role": "user", "content": text},
             ],
-            "temperature": 0.25,
-            "max_tokens": 256,
+            "temperature": 0.2,
+            "max_tokens": 200,
         }
 
-        req = urllib.request.Request(
-            endpoint,
-            data=json.dumps(payload).encode("utf-8"),
+        raw = client.request(
+            "POST",
+            path,
+            body=json.dumps(payload).encode("utf-8"),
             headers={
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {cfg.llm_api_key.strip()}",
-                "User-Agent": "AniLingo/1.0",
             },
-            method="POST",
         )
-        with urllib.request.urlopen(req, timeout=8.0) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
-            content = body["choices"][0]["message"]["content"].strip()
-            content = content.strip("「」『』\"'")
-            return content
+        body = json.loads(raw.decode("utf-8"))
+        content = body["choices"][0]["message"]["content"].strip()
+        return content.strip("「」『』\"'")
 
     @staticmethod
     def _guess_lang(text: str) -> str:
-        # Check Japanese Hiragana / Katakana
         if re.search(r"[\u3040-\u30ff]", text):
             return "ja"
-        # Check Korean Hangul
         if re.search(r"[\uac00-\ud7af]", text):
             return "ko"
-        # Check Cyrillic
         if re.search(r"[\u0400-\u04ff]", text):
             return "ru"
         return "en"

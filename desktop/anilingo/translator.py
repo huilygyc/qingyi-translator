@@ -65,7 +65,7 @@ class _KeepAliveClient:
                     conn.request(method, path, body=body, headers=req_headers)
                     resp = conn.getresponse()
                     data = resp.read()
-                    if not keep_alive:
+                    if not keep_alive or getattr(resp, "will_close", False):
                         self._reset()
                     if resp.status >= 400:
                         raise RuntimeError(f"HTTP {resp.status}")
@@ -91,26 +91,23 @@ class TranslationService:
         self._cache: OrderedDict[str, str] = OrderedDict()
         self._context_window: List[Tuple[str, str]] = []
         self._lock = threading.RLock()
-        self._race_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="TransRace")
+        self._race_pool = concurrent.futures.ThreadPoolExecutor(max_workers=6, thread_name_prefix="TransRace")
 
         self._clients: Dict[str, _KeepAliveClient] = {
-            "chrome_dict": _KeepAliveClient("clients5.google.com", True, timeout=2.2),
-            "google_gtx": _KeepAliveClient("translate.googleapis.com", True, timeout=2.2),
-            "youdao_m": _KeepAliveClient("m.youdao.com", True, timeout=2.8),
-            "mymemory": _KeepAliveClient("api.mymemory.translated.net", True, timeout=3.2),
+            "chrome_dict": _KeepAliveClient("clients5.google.com", True, timeout=2.0),
+            "google_gtx": _KeepAliveClient("translate.googleapis.com", True, timeout=2.0),
+            "youdao_m": _KeepAliveClient("m.youdao.com", True, timeout=2.5),
+            "mymemory": _KeepAliveClient("api.mymemory.translated.net", True, timeout=2.8),
         }
         self._llm_clients: Dict[str, _KeepAliveClient] = {}
         self._cooldown_until: Dict[str, float] = {}
 
     def warmup_connections(self) -> None:
-        """Pre-establishes primary sockets in background so subtitle #1 has minimal TLS latency."""
+        """Pre-establishes primary & backup sockets in parallel so even sentence #1 avoids TLS cold start."""
         mode = self.cfg_mgr.config.trans_engine
-        targets = ["youdao_m"] if mode == "cn_direct" else ["chrome_dict", "youdao_m"]
-        for ch in targets:
-            try:
-                self._call_free_channel(ch, "hello", "en", "zh-CN")
-            except Exception:
-                self._mark_cooldown(ch, 45.0)
+        targets = ["youdao_m", "mymemory"] if mode == "cn_direct" else ["chrome_dict", "youdao_m", "google_gtx"]
+        futs = [self._race_pool.submit(self._call_free_channel, ch, "hello", "en", "zh-CN") for ch in targets]
+        concurrent.futures.wait(futs, timeout=2.2)
 
     def clear_cache(self) -> None:
         with self._lock:
@@ -260,7 +257,7 @@ class TranslationService:
                     "Referer": "https://m.youdao.com/translate",
                     "User-Agent": "Mozilla/5.0 (Linux; Android 14)",
                 },
-                keep_alive=False,
+                keep_alive=True,
             )
             page = raw.decode("utf-8", errors="ignore")
             m = re.search(r'<ul id="translateResult">\s*<li>(.*?)</li>', page, re.S)
@@ -278,19 +275,46 @@ class TranslationService:
                 return str(t_text).strip()
         return ""
 
-    def _race_channels(self, channels: List[str], prepared: str, sl: str, tl: str) -> str:
-        """Runs candidate channels concurrently and returns immediately on the first valid translation."""
-        active = [ch for ch in channels if not self._is_cooling_down(ch)]
-        if not active:
-            active = list(channels)
+    def _race_staggered(
+        self,
+        primary: List[str],
+        hedge: List[str],
+        prepared: str,
+        sl: str,
+        tl: str,
+        hedge_delay_sec: float = 0.40,
+        total_timeout_sec: float = 3.0,
+    ) -> str:
+        """
+        Staggered Hedge Racing:
+        Starts primary fast channels immediately; if no valid answer arrives within 400ms,
+        automatically launches hedge backup channels into the same live race to crush 800ms tail spikes.
+        """
+        start_t = time.monotonic()
+        active_primary = [ch for ch in primary if not self._is_cooling_down(ch)] or list(primary)
+        active_hedge = [ch for ch in hedge if ch not in active_primary and not self._is_cooling_down(ch)]
 
-        futures = {
+        pending: Dict[concurrent.futures.Future, str] = {
             self._race_pool.submit(self._call_free_channel, ch, prepared, sl, tl): ch
-            for ch in active
+            for ch in active_primary
         }
-        try:
-            for fut in concurrent.futures.as_completed(futures, timeout=3.2):
-                ch = futures[fut]
+        hedged = not active_hedge
+
+        while pending:
+            elapsed = time.monotonic() - start_t
+            remaining = total_timeout_sec - elapsed
+            if remaining <= 0:
+                break
+
+            wait_slice = min(remaining, max(0.02, hedge_delay_sec - elapsed)) if not hedged else remaining
+            done, _ = concurrent.futures.wait(
+                list(pending.keys()),
+                timeout=wait_slice,
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+
+            for fut in done:
+                ch = pending.pop(fut, "")
                 try:
                     res = fut.result()
                     if res:
@@ -298,8 +322,13 @@ class TranslationService:
                         return res
                 except Exception:
                     self._mark_cooldown(ch, 75.0)
-        except concurrent.futures.TimeoutError:
-            pass
+
+            # Launch hedge channels once 400ms elapses (or if all primary channels already failed fast)
+            if not hedged and ((time.monotonic() - start_t) >= hedge_delay_sec or not pending):
+                hedged = True
+                for ch in active_hedge:
+                    pending[self._race_pool.submit(self._call_free_channel, ch, prepared, sl, tl)] = ch
+
         return ""
 
     def _translate_via_free_channels(self, text: str, glossary: Dict[str, str]) -> str:
@@ -309,21 +338,16 @@ class TranslationService:
         tl = cfg.target_lang
 
         if cfg.trans_engine == "cn_direct":
-            # Mainland China direct zero-proxy racing (never stalls on Google)
-            res = self._race_channels(["youdao_m", "mymemory"], prepared, sl, tl)
+            res = self._race_staggered(["youdao_m"], ["mymemory"], prepared, sl, tl, hedge_delay_sec=0.38)
             if res:
                 return self._restore_placeholders(res, placeholders)
         elif cfg.trans_engine == "google_first":
-            res = self._race_channels(["chrome_dict", "google_gtx"], prepared, sl, tl)
-            if not res:
-                res = self._race_channels(["youdao_m", "mymemory"], prepared, sl, tl)
+            res = self._race_staggered(["chrome_dict", "google_gtx"], ["youdao_m", "mymemory"], prepared, sl, tl, hedge_delay_sec=0.40)
             if res:
                 return self._restore_placeholders(res, placeholders)
         else:
-            # Default 'auto_free': race Google Keep-Alive + China-direct Youdao concurrently!
-            res = self._race_channels(["chrome_dict", "youdao_m"], prepared, sl, tl)
-            if not res:
-                res = self._race_channels(["google_gtx", "mymemory"], prepared, sl, tl)
+            # Default 'auto_free': race Google Keep-Alive + Youdao immediately, hedge google_gtx + MyMemory at 400ms
+            res = self._race_staggered(["chrome_dict", "youdao_m"], ["google_gtx", "mymemory"], prepared, sl, tl, hedge_delay_sec=0.40)
             if res:
                 return self._restore_placeholders(res, placeholders)
 

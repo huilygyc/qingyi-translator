@@ -155,10 +155,14 @@ class SubtitleStyleConfig:
     bg_color: str = "#0F172A"
     bg_opacity: int = 0
     bg_radius: int = 16
+    fit_bg_to_text: bool = True
+    anchor_bottom: bool = True
+    keep_prev_line: bool = True
+    display_mode: str = "subtitle"  # "subtitle" | "danmaku"
     overlay_x: int = -1
     overlay_y: int = -1
     overlay_width: int = 920
-    overlay_height: int = 155
+    overlay_height: int = 195
     locked_click_through: bool = False
     exclude_from_capture: bool = True
 

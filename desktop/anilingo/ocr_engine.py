@@ -27,6 +27,9 @@ class ScreenOCREngine:
         self._ocr: Any = None
         self._ocr_lock = threading.Lock()
         self._prev_thumb: Optional[np.ndarray] = None
+        self._last_poll_thumb: Optional[np.ndarray] = None
+        self._frame_is_stable: bool = False
+        self._last_mean_score: float = 1.0
         self._prev_text: str = ""
         self._pending_candidate: str = ""
         self._empty_streak: int = 0
@@ -62,6 +65,9 @@ class ScreenOCREngine:
 
     def reset_dedup(self) -> None:
         self._prev_thumb = None
+        self._last_poll_thumb = None
+        self._frame_is_stable = False
+        self._last_mean_score = 1.0
         self._prev_text = ""
         self._pending_candidate = ""
         self._empty_streak = 0
@@ -80,16 +86,27 @@ class ScreenOCREngine:
             return cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
 
     def has_frame_changed(self, bgr: np.ndarray, diff_threshold: float = 3.2) -> bool:
-        """Ultra-fast ~1ms grayscale thumbnail comparison so idle scenes cost ~0% CPU."""
+        """Ultra-fast ~1ms grayscale thumbnail comparison with inter-frame pixel-stability tracking."""
         import cv2
 
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
         thumb = cv2.resize(gray, (64, 20), interpolation=cv2.INTER_NEAREST).astype(np.float32)
+
+        if self._last_poll_thumb is not None:
+            inter_mad = float(np.mean(np.abs(thumb - self._last_poll_thumb)))
+            self._frame_is_stable = inter_mad < 2.2
+        else:
+            self._frame_is_stable = False
+        self._last_poll_thumb = thumb
+
         if self._prev_thumb is None:
             self._prev_thumb = thumb
             return True
         mad = float(np.mean(np.abs(thumb - self._prev_thumb)))
         if mad < diff_threshold:
+            # If we had a pending candidate waiting for confirmation and pixels are now stable, allow 1 confirmation pass
+            if self._pending_candidate and self._frame_is_stable:
+                return True
             return False
         self._prev_thumb = thumb
         return True
@@ -118,11 +135,13 @@ class ScreenOCREngine:
         scores = list(getattr(result, "scores", [1.0] * len(txts)))
 
         items: List[Tuple[float, float, str]] = []
+        valid_scores: List[float] = []
         for idx, txt in enumerate(txts):
             score = float(scores[idx]) if idx < len(scores) else 1.0
             clean = (txt or "").strip()
             if not clean or score < 0.50:
                 continue
+            valid_scores.append(score)
             if boxes is not None and idx < len(boxes):
                 box = boxes[idx]
                 top_y = float(min(pt[1] for pt in box))
@@ -132,8 +151,10 @@ class ScreenOCREngine:
             items.append((top_y, left_x, clean))
 
         if not items:
+            self._last_mean_score = 0.0
             return ""
 
+        self._last_mean_score = sum(valid_scores) / max(1, len(valid_scores))
         items.sort(key=lambda it: (round(it[0] / 18.0), it[1]))
         merged = self._join_subtitle_fragments([it[2] for it in items])
 
@@ -162,15 +183,19 @@ class ScreenOCREngine:
             self._pending_candidate = ""
             return False
 
-        # Optional 2-frame debounce prevents flashing single-frame transition artifacts
+        # Smart Pixel-Stability & Confidence Debounce:
+        # Crisp, fully-rendered cuts (high confidence >= 0.90 or already pixel-stable) pass on frame 1 (saves 220ms!).
+        # Blurry fade-ins / noisy flashes (< 0.90 confidence while pixels are still changing) wait for 2nd frame confirm.
         if stabilize:
-            if not self._pending_candidate:
-                self._pending_candidate = clean
-                return False
-            cand_sim = SequenceMatcher(None, clean, self._pending_candidate).ratio()
-            if cand_sim < 0.72:
-                self._pending_candidate = clean
-                return False
+            crisp_clean_cut = self._last_mean_score >= 0.90 and len(clean) >= 3
+            if not crisp_clean_cut and not self._frame_is_stable:
+                if not self._pending_candidate:
+                    self._pending_candidate = clean
+                    return False
+                cand_sim = SequenceMatcher(None, clean, self._pending_candidate).ratio()
+                if cand_sim < 0.72:
+                    self._pending_candidate = clean
+                    return False
             self._pending_candidate = ""
 
         self._prev_text = clean

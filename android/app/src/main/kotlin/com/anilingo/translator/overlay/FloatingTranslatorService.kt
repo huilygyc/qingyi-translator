@@ -6,6 +6,8 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
@@ -94,6 +96,8 @@ class FloatingTranslatorService : Service() {
     private var imageReader: ImageReader? = null
     private var screenLoopJob: Job? = null
     private var autoHideJob: Job? = null
+    private var prevClearJob: Job? = null
+    private var freezeChipView: TextView? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -256,6 +260,21 @@ class FloatingTranslatorService : Service() {
             if (mediaProjection == null) requestProjectionViaActivity("snip") else showRegionPicker("snip")
         })
         barRow.addView(makeActionChip("听译") { toggleAudio() })
+        barRow.addView(makeActionChip("复制") {
+            val txt = AppStateBus.currentTranslated.value
+            if (txt.isNotBlank()) {
+                val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                cm.setPrimaryClip(ClipData.newPlainText("QingYiSubtitle", txt))
+                Toast.makeText(this, "已复制译文", Toast.LENGTH_SHORT).show()
+            }
+        })
+        val fChip = makeActionChip("冻住") {
+            val next = !AppStateBus.subtitleFrozen.value
+            AppStateBus.setSubtitleFrozen(next)
+            Toast.makeText(this, if (next) "字幕已冻住" else "已恢复实时更新", Toast.LENGTH_SHORT).show()
+        }
+        freezeChipView = fChip
+        barRow.addView(fChip)
         barRow.addView(makeActionChip("主题") {
             val preset = AppStateBus.cycleNextPreset(this)
             Toast.makeText(this, "主题：${preset.title}", Toast.LENGTH_SHORT).show()
@@ -354,17 +373,49 @@ class FloatingTranslatorService : Service() {
         }
         serviceScope.launch {
             AppStateBus.currentTranslated.collectLatest { trans ->
-                lyricsView?.translatedText = trans
-                lyricsView?.alpha = 1f
+                lyricsView?.let { lv ->
+                    lv.translatedText = trans
+                    lv.animate().cancel()
+                    lv.alpha = 0.25f
+                    lv.translationY = dp(6f).toFloat()
+                    lv.animate().alpha(1f).translationY(0f).setDuration(160L).start()
+                }
                 autoHideJob?.cancel()
                 val sec = AppStateBus.style.value.autoHideSeconds
-                if (sec > 0 && trans.isNotBlank()) {
+                if (sec > 0 && trans.isNotBlank() && !AppStateBus.subtitleFrozen.value) {
                     autoHideJob = serviceScope.launch {
                         delay(sec * 1000L)
-                        if (toolbarScroll?.visibility != View.VISIBLE) {
-                            lyricsView?.alpha = 0f
+                        if (toolbarScroll?.visibility != View.VISIBLE && !AppStateBus.subtitleFrozen.value) {
+                            lyricsView?.animate()?.alpha(0f)?.setDuration(300L)?.start()
                         }
                     }
+                }
+            }
+        }
+        serviceScope.launch {
+            AppStateBus.previousTranslated.collectLatest { prev ->
+                lyricsView?.previousTranslatedText = prev
+                prevClearJob?.cancel()
+                if (prev.isNotBlank()) {
+                    prevClearJob = serviceScope.launch {
+                        delay(3200L)
+                        AppStateBus.clearPreviousTranslated()
+                    }
+                }
+            }
+        }
+        serviceScope.launch {
+            AppStateBus.recentLines.collectLatest { list ->
+                lyricsView?.danmakuLines = list
+            }
+        }
+        serviceScope.launch {
+            AppStateBus.subtitleFrozen.collectLatest { frozen ->
+                freezeChipView?.text = if (frozen) "已冻住" else "冻住"
+                freezeChipView?.setTextColor(Color.parseColor(if (frozen) "#2563EB" else "#1E293B"))
+                if (frozen) {
+                    autoHideJob?.cancel()
+                    lyricsView?.animate()?.alpha(1f)?.setDuration(120L)?.start()
                 }
             }
         }

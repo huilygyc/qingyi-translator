@@ -94,6 +94,10 @@ data class MobileLyricsStyle(
     val strokeWidthDp: Float = 3.2f,
     val shadowRadiusDp: Float = 3.8f,
     val bgAlpha: Int = 0,
+    val fitBgToText: Boolean = true,
+    val anchorBottom: Boolean = true,
+    val keepPrevLine: Boolean = true,
+    val displayMode: String = "subtitle", // "subtitle" | "danmaku"
     val autoHideSeconds: Int = 6,
     val lockedClickThrough: Boolean = false,
 )
@@ -136,6 +140,15 @@ object AppStateBus {
 
     private val _currentTranslated = MutableStateFlow("悬浮字幕已就绪，轻触可展开控制条")
     val currentTranslated: StateFlow<String> = _currentTranslated.asStateFlow()
+
+    private val _previousTranslated = MutableStateFlow("")
+    val previousTranslated: StateFlow<String> = _previousTranslated.asStateFlow()
+
+    private val _recentLines = MutableStateFlow<List<String>>(emptyList())
+    val recentLines: StateFlow<List<String>> = _recentLines.asStateFlow()
+
+    private val _subtitleFrozen = MutableStateFlow(false)
+    val subtitleFrozen: StateFlow<Boolean> = _subtitleFrozen.asStateFlow()
 
     private val _statusText = MutableStateFlow("就绪")
     val statusText: StateFlow<String> = _statusText.asStateFlow()
@@ -183,6 +196,10 @@ object AppStateBus {
             strokeColor = sp.getInt("strokeColor", Color.parseColor("#1E293B")),
             strokeWidthDp = sp.getFloat("strokeWidthDp", 3.2f),
             bgAlpha = sp.getInt("bgAlpha", 0),
+            fitBgToText = sp.getBoolean("fitBgToText", true),
+            anchorBottom = sp.getBoolean("anchorBottom", true),
+            keepPrevLine = sp.getBoolean("keepPrevLine", true),
+            displayMode = sp.getString("displayMode", "subtitle") ?: "subtitle",
             autoHideSeconds = sp.getInt("autoHideSeconds", 6),
             lockedClickThrough = false,
         )
@@ -239,6 +256,10 @@ object AppStateBus {
             .putInt("strokeColor", st.strokeColor)
             .putFloat("strokeWidthDp", st.strokeWidthDp)
             .putInt("bgAlpha", st.bgAlpha)
+            .putBoolean("fitBgToText", st.fitBgToText)
+            .putBoolean("anchorBottom", st.anchorBottom)
+            .putBoolean("keepPrevLine", st.keepPrevLine)
+            .putString("displayMode", st.displayMode)
             .putInt("autoHideSeconds", st.autoHideSeconds)
             .putString("transEngine", ec.transEngine)
             .putString("sourceLang", ec.sourceLang)
@@ -310,13 +331,47 @@ object AppStateBus {
         _statusText.value = msg
     }
 
+    fun setSubtitleFrozen(frozen: Boolean) {
+        _subtitleFrozen.value = frozen
+    }
+
+    fun clearPreviousTranslated() {
+        _previousTranslated.value = ""
+    }
+
     fun publishSubtitle(source: String, original: String, translated: String) {
         val o = original.trim()
         val t = translated.trim()
-        _currentOriginal.value = o
-        _currentTranslated.value = t
+        if (t.isEmpty()) return
         val rec = SubtitleRecord(System.currentTimeMillis(), source, o, t)
         _history.value = (_history.value + rec).takeLast(120)
+        if (_subtitleFrozen.value) return
+
+        val oldT = _currentTranslated.value
+        if (oldT.isNotBlank() && oldT != t && !oldT.startsWith("悬浮字幕已就绪") && _style.value.keepPrevLine) {
+            _previousTranslated.value = oldT
+        }
+        _currentOriginal.value = o
+        _currentTranslated.value = t
+        val nextRecent = (_recentLines.value.filterNot { it == t } + t).takeLast(3)
+        _recentLines.value = nextRecent
+    }
+
+    fun mergeGlossary(context: Context, incoming: Map<String, String>): Int {
+        if (incoming.isEmpty()) return 0
+        val next = LinkedHashMap(_glossary.value)
+        var added = 0
+        incoming.forEach { (k, v) ->
+            val ks = k.trim()
+            val vs = v.trim()
+            if (ks.isNotEmpty() && vs.isNotEmpty()) {
+                if (next[ks] != vs) added++
+                next[ks] = vs
+            }
+        }
+        _glossary.value = next
+        saveAll(context)
+        return added
     }
 
     fun editCurrentSubtitle(newOrig: String, newTrans: String) {

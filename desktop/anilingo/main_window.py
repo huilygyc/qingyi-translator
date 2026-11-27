@@ -588,6 +588,8 @@ class MainWindow(QMainWindow):
         sb_lay.addWidget(sb_lbl)
         sb_lay.addStretch()
 
+        btn_align_cur = QPushButton("贴合字幕区")
+        btn_align_cur.clicked.connect(lambda: self._align_subtitle_to_region(False))
         btn_edit_cur = QPushButton("修改译文")
         btn_edit_cur.clicked.connect(self.open_inline_subtitle_editor)
         btn_style_go = QPushButton("调整样式")
@@ -595,6 +597,8 @@ class MainWindow(QMainWindow):
         self.btn_lock_overlay = QPushButton("锁定穿透")
         self.btn_lock_overlay.clicked.connect(self._toggle_lock_overlay)
 
+        sb_lay.addWidget(btn_align_cur)
+        sb_lay.addSpacing(6)
         sb_lay.addWidget(btn_edit_cur)
         sb_lay.addSpacing(6)
         sb_lay.addWidget(btn_style_go)
@@ -607,10 +611,17 @@ class MainWindow(QMainWindow):
 
     # --- Page 1: Subtitle Appearance ---
     def _build_page_style(self) -> None:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+
         page = QWidget()
+        page.setStyleSheet("background: transparent;")
         lay = QVBoxLayout(page)
-        lay.setContentsMargins(32, 26, 32, 24)
-        lay.setSpacing(16)
+        lay.setContentsMargins(32, 22, 32, 22)
+        lay.setSpacing(14)
 
         title = QLabel("字幕外观")
         title.setProperty("role", "pageTitle")
@@ -618,9 +629,12 @@ class MainWindow(QMainWindow):
 
         self.style_studio = LyricsStyleStudioWidget(self.cfg_mgr, self)
         self.style_studio.style_changed.connect(self._on_style_updated)
+        self.style_studio.request_align_region.connect(self._align_subtitle_to_region)
         lay.addWidget(self.style_studio)
         lay.addStretch()
-        self.pages.addWidget(page)
+
+        scroll.setWidget(page)
+        self.pages.addWidget(scroll)
 
     # --- Page 2: Dedicated Clean Hotkeys Page ---
     def _build_page_hotkeys(self) -> None:
@@ -870,7 +884,8 @@ class MainWindow(QMainWindow):
         self.chk_show_border = QCheckBox("显示区域四角辅助标")
         self.chk_show_border.setChecked(self.cfg_mgr.config.show_region_border)
         self.chk_show_border.toggled.connect(self._on_region_border_toggled)
-        self.chk_stabilize = QCheckBox("双帧防抖")
+        self.chk_stabilize = QCheckBox("智能防抖")
+        self.chk_stabilize.setToolTip("清晰切换时首帧直接放行，仅在淡入残影时等待确认")
         self.chk_stabilize.setChecked(self.cfg_mgr.config.ocr_stabilize)
         sp_row.addWidget(self.combo_interval)
         sp_row.addSpacing(12)
@@ -1219,8 +1234,18 @@ class MainWindow(QMainWindow):
         dlg.glossary_added.connect(self._on_inline_glossary_added)
         dlg.exec()
 
+    def _align_subtitle_to_region(self, cover: bool = False) -> None:
+        r = self.cfg_mgr.config.capture_region
+        rect = QRect(int(r[0]), int(r[1]), max(100, int(r[2])), max(32, int(r[3])))
+        if not self.lyrics_win.isVisible():
+            self.lyrics_win.show()
+            self.chk_sub_vis.setChecked(True)
+        self.lyrics_win.snap_to_region(rect, cover=cover)
+        self.style_studio.sync_from_config()
+        self._set_status("悬浮字幕已覆盖原硬字幕区" if cover else "悬浮字幕已贴合原字幕上方")
+
     def _apply_manual_edit(self, new_orig: str, new_trans: str) -> None:
-        self.lyrics_win.set_subtitle(new_orig, new_trans)
+        self.lyrics_win.set_subtitle(new_orig, new_trans, force=True)
         if self._current_entry_id:
             self.cfg_mgr.update_history_entry(self._current_entry_id, new_orig, new_trans)
         else:

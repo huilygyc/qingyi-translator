@@ -366,10 +366,48 @@ private fun LyricsStyleTab() {
             }
 
             Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-                Text("6 秒无新台词自动隐藏字幕", color = TextMain, modifier = Modifier.weight(1f), fontSize = 13.5.sp)
+                Text("6 秒无新台词自动淡出隐藏", color = TextMain, modifier = Modifier.weight(1f), fontSize = 13.5.sp)
                 Switch(
                     checked = st.autoHideSeconds > 0,
                     onCheckedChange = { c -> AppStateBus.updateStyle(ctx) { it.copy(autoHideSeconds = if (c) 6 else 0) } }
+                )
+            }
+
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                Text("底板贴合文字宽度", color = TextMain, modifier = Modifier.weight(1f), fontSize = 13.5.sp)
+                Switch(
+                    checked = st.fitBgToText,
+                    onCheckedChange = { c -> AppStateBus.updateStyle(ctx) { it.copy(fitBgToText = c) } }
+                )
+            }
+
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                Text("保留上一句防语速过快", color = TextMain, modifier = Modifier.weight(1f), fontSize = 13.5.sp)
+                Switch(
+                    checked = st.keepPrevLine,
+                    onCheckedChange = { c -> AppStateBus.updateStyle(ctx) { it.copy(keepPrevLine = c) } }
+                )
+            }
+
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                Text("底部锚定防跳动", color = TextMain, modifier = Modifier.weight(1f), fontSize = 13.5.sp)
+                Switch(
+                    checked = st.anchorBottom,
+                    onCheckedChange = { c -> AppStateBus.updateStyle(ctx) { it.copy(anchorBottom = c) } }
+                )
+            }
+
+            Text("显示模式", color = TextMain, fontWeight = FontWeight.Bold, fontSize = 13.5.sp)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilterChip(
+                    selected = st.displayMode == "subtitle",
+                    onClick = { AppStateBus.updateStyle(ctx) { it.copy(displayMode = "subtitle") } },
+                    label = { Text("标准字幕（影院双句）", fontSize = 12.sp) }
+                )
+                FilterChip(
+                    selected = st.displayMode == "danmaku",
+                    onClick = { AppStateBus.updateStyle(ctx) { it.copy(displayMode = "danmaku") } },
+                    label = { Text("轻量弹幕流", fontSize = 12.sp) }
                 )
             }
         }
@@ -379,13 +417,16 @@ private fun LyricsStyleTab() {
 @Composable
 private fun EditAndGlossaryTab() {
     val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
     val curOrig by AppStateBus.currentOriginal.collectAsState()
     val curTrans by AppStateBus.currentTranslated.collectAsState()
     val glossary by AppStateBus.glossary.collectAsState()
+    val cfg by AppStateBus.engineConfig.collectAsState()
 
     var editTrans by remember(curTrans) { mutableStateOf(curTrans) }
     var newSrc by remember { mutableStateOf("") }
     var newDst by remember { mutableStateOf("") }
+    var glossSyncTip by remember { mutableStateOf("") }
 
     Column(
         modifier = Modifier
@@ -412,7 +453,25 @@ private fun EditAndGlossaryTab() {
         }
 
         CleanCard {
-            Text("专有名词词表", color = TextMain, fontWeight = FontWeight.Bold, fontSize = 15.sp)
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                Text("专有名词词表", color = TextMain, fontWeight = FontWeight.Bold, fontSize = 15.sp, modifier = Modifier.weight(1f))
+                if (cfg.pcLanUrl.isNotBlank()) {
+                    OutlinedButton(
+                        onClick = {
+                            scope.launch {
+                                val n = runCatching { MobileTranslator.syncGlossaryFromPcLan(ctx, cfg.pcLanUrl) }.getOrDefault(-1)
+                                glossSyncTip = if (n >= 0) "已与电脑端双向同步，共 $n 条词条" else "同步失败，请检查电脑端局域网连接"
+                            }
+                        },
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+                        Text("同步电脑词表", fontSize = 12.sp)
+                    }
+                }
+            }
+            if (glossSyncTip.isNotBlank()) {
+                Text(glossSyncTip, color = PrimaryBlue, fontSize = 12.sp)
+            }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedTextField(
                     value = newSrc,
@@ -536,14 +595,14 @@ private fun EngineSettingsTab() {
                 OutlinedButton(
                     onClick = {
                         scope.launch {
-                            val n = runCatching { MobileTranslator.syncGlossaryFromPcLan(pcLan) }.getOrDefault(-1)
-                            syncMsg = if (n >= 0) "连接成功，已读取电脑端 $n 条词表" else "无法连接电脑端，请确认处于同一 Wi-Fi"
+                            val n = runCatching { MobileTranslator.syncGlossaryFromPcLan(ctx, pcLan) }.getOrDefault(-1)
+                            syncMsg = if (n >= 0) "双向同步成功，当前词表共 $n 条" else "无法连接电脑端，请确认处于同一 Wi-Fi"
                         }
                     },
                     shape = RoundedCornerShape(9.dp),
                     modifier = Modifier.weight(1f)
                 ) {
-                    Text("测试电脑连接")
+                    Text("同步电脑词表")
                 }
                 Button(
                     onClick = {

@@ -1,12 +1,13 @@
 package com.anilingo.translator.engine
 
+import android.content.Context
 import android.text.Html
 import android.util.LruCache
 import com.anilingo.translator.model.AppStateBus
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -67,23 +68,45 @@ object MobileTranslator {
         postFixed.ifBlank { clean }
     }
 
-    suspend fun syncGlossaryFromPcLan(pcLanUrl: String): Int = withContext(Dispatchers.IO) {
+    suspend fun syncGlossaryFromPcLan(context: Context, pcLanUrl: String): Int = withContext(Dispatchers.IO) {
         val base = pcLanUrl.trim().trimEnd('/')
-        if (base.isEmpty()) return@withContext 0
-        val conn = (URL("$base/api/glossary").openConnection() as HttpURLConnection).apply {
+        if (base.isEmpty()) return@withContext -1
+        // 1. Pull glossary from Desktop PC LAN Bridge
+        val getConn = (URL("$base/api/glossary").openConnection() as HttpURLConnection).apply {
             connectTimeout = 3500
             readTimeout = 3500
             requestMethod = "GET"
         }
-        val body = conn.inputStream.bufferedReader().use(BufferedReader::readText)
+        val body = getConn.inputStream.bufferedReader().use(BufferedReader::readText)
         val gObj = JSONObject(body).optJSONObject("glossary") ?: return@withContext 0
-        var count = 0
+        val pulled = LinkedHashMap<String, String>()
         val keys = gObj.keys()
         while (keys.hasNext()) {
             val k = keys.next()
-            if (k.isNotBlank() && gObj.optString(k).isNotBlank()) count++
+            val v = gObj.optString(k, "").trim()
+            if (k.isNotBlank() && v.isNotBlank()) pulled[k] = v
         }
-        count
+        AppStateBus.mergeGlossary(context, pulled)
+        clearCache()
+
+        // 2. Push merged glossary back to Desktop PC so both devices stay in sync
+        runCatching {
+            val merged = AppStateBus.glossary.value
+            val outObj = JSONObject()
+            merged.forEach { (k, v) -> outObj.put(k, v) }
+            val postConn = (URL("$base/api/glossary").openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"
+                doOutput = true
+                connectTimeout = 3000
+                readTimeout = 3000
+                setRequestProperty("Content-Type", "application/json")
+            }
+            postConn.outputStream.use {
+                it.write(JSONObject().put("glossary", outObj).toString().toByteArray(Charsets.UTF_8))
+            }
+            postConn.inputStream.bufferedReader().use(BufferedReader::readText)
+        }
+        AppStateBus.glossary.value.size
     }
 
     private fun preApplyGlossary(text: String, glossary: Map<String, String>): Pair<String, List<Pair<String, String>>> {
@@ -124,22 +147,43 @@ object MobileTranslator {
         return out.trim()
     }
 
-    private suspend fun raceCallers(callers: List<() -> String>): String = coroutineScope {
+    private suspend fun raceStaggered(
+        primary: List<() -> String>,
+        hedge: List<() -> String>,
+        hedgeDelayMs: Long = 400L,
+    ): String = coroutineScope {
         val winner = CompletableDeferred<String>()
-        val jobs = callers.map { fn ->
-            launch(Dispatchers.IO) {
+        val allJobs = mutableListOf<kotlinx.coroutines.Job>()
+
+        primary.forEach { fn ->
+            allJobs += launch(Dispatchers.IO) {
                 val res = runCatching { fn() }.getOrDefault("")
                 if (res.isNotBlank()) winner.complete(res)
             }
         }
-        val result = withTimeoutOrNull(3200L) {
-            launch {
-                jobs.forEach { it.join() }
-                if (!winner.isCompleted) winner.complete("")
+
+        val hedgeLauncher = launch(Dispatchers.IO) {
+            if (hedge.isNotEmpty()) {
+                delay(hedgeDelayMs)
+                if (!winner.isCompleted) {
+                    val hedgeJobs = hedge.map { fn ->
+                        launch(Dispatchers.IO) {
+                            val res = runCatching { fn() }.getOrDefault("")
+                            if (res.isNotBlank()) winner.complete(res)
+                        }
+                    }
+                    allJobs.forEach { it.join() }
+                    hedgeJobs.forEach { it.join() }
+                }
+            } else {
+                allJobs.forEach { it.join() }
             }
-            winner.await()
-        } ?: ""
-        jobs.forEach { it.cancel() }
+            if (!winner.isCompleted) winner.complete("")
+        }
+
+        val result = withTimeoutOrNull(3200L) { winner.await() } ?: ""
+        hedgeLauncher.cancel()
+        allJobs.forEach { it.cancel() }
         result
     }
 
@@ -150,12 +194,17 @@ object MobileTranslator {
         val tl = cfg.targetLang
 
         val winner = if (mode == "cn_direct") {
-            raceCallers(listOf({ callYoudaoMobile(prepared, sl, tl) }, { callMyMemory(prepared, sl, tl) }))
+            raceStaggered(
+                primary = listOf { callYoudaoMobile(prepared, sl, tl) },
+                hedge = listOf { callMyMemory(prepared, sl, tl) },
+                hedgeDelayMs = 380L,
+            )
         } else {
-            val fast = raceCallers(listOf({ callGoogleChromeDict(prepared, sl, tl) }, { callYoudaoMobile(prepared, sl, tl) }))
-            fast.ifBlank {
-                raceCallers(listOf({ callGoogleGtx(prepared, sl, tl) }, { callMyMemory(prepared, sl, tl) }))
-            }
+            raceStaggered(
+                primary = listOf({ callGoogleChromeDict(prepared, sl, tl) }, { callYoudaoMobile(prepared, sl, tl) }),
+                hedge = listOf({ callGoogleGtx(prepared, sl, tl) }, { callMyMemory(prepared, sl, tl) }),
+                hedgeDelayMs = 400L,
+            )
         }
         return restorePlaceholders(winner.ifBlank { prepared }, placeholders)
     }

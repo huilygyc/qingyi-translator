@@ -159,6 +159,10 @@ class SubtitleStyleConfig:
     anchor_bottom: bool = True
     keep_prev_line: bool = True
     display_mode: str = "subtitle"  # "subtitle" | "danmaku"
+    bilingual_order: str = "trans_top"  # "trans_top" | "orig_top"
+    highlight_glossary: bool = True
+    auto_contrast_bg: bool = True
+    alt_temp_unlock: bool = True
     overlay_x: int = -1
     overlay_y: int = -1
     overlay_width: int = 920

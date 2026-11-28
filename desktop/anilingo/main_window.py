@@ -648,6 +648,7 @@ class MainWindow(QMainWindow):
         self.style_studio = LyricsStyleStudioWidget(self.cfg_mgr, self)
         self.style_studio.style_changed.connect(self._on_style_updated)
         self.style_studio.request_align_region.connect(self._align_subtitle_to_region)
+        self.style_studio.request_reset_center.connect(self.lyrics_win.reset_position_center)
         lay.addWidget(self.style_studio)
         lay.addStretch()
 
@@ -972,9 +973,11 @@ class MainWindow(QMainWindow):
         act_snip.triggered.connect(lambda: self.start_region_selection("snip"))
         act_unlock = QAction("锁定 / 解锁字幕穿透", self)
         act_unlock.triggered.connect(self._toggle_lock_overlay)
+        act_center = QAction("复位字幕到底部居中", self)
+        act_center.triggered.connect(self.lyrics_win.reset_position_center)
         act_quit = QAction("退出轻译", self)
         act_quit.triggered.connect(self.quit_application)
-        for a in (act_show, act_snip, act_unlock, act_quit):
+        for a in (act_show, act_snip, act_unlock, act_center, act_quit):
             menu.addAction(a)
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(

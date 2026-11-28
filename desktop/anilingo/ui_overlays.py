@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import math
+import re
+import threading
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (
@@ -40,7 +43,14 @@ from PySide6.QtWidgets import (
 )
 
 from .config import LYRICS_STYLE_PRESETS, ConfigManager
-from .win32_utils import qt_key_event_to_hotkey_str, set_exclude_from_capture, set_window_click_through
+from .win32_utils import (
+    FastWin32ScreenCapturer,
+    is_alt_key_pressed,
+    logical_rect_to_physical,
+    qt_key_event_to_hotkey_str,
+    set_exclude_from_capture,
+    set_window_click_through,
+)
 
 
 class HotkeyRecorderEdit(QLineEdit):
@@ -232,6 +242,17 @@ class InlineSubtitleEditDialog(QDialog):
         self.accept()
 
 
+def _find_highlight_spans(text: str, terms: Optional[List[str]]) -> List[Tuple[int, int]]:
+    """Finds non-overlapping character spans matching glossary target names for subtle accent highlighting."""
+    if not text or not terms:
+        return []
+    uniq = sorted({t.strip() for t in terms if t and len(t.strip()) >= 2}, key=len, reverse=True)[:60]
+    if not uniq:
+        return []
+    pattern = "|".join(re.escape(t) for t in uniq)
+    return [(m.start(), m.end()) for m in re.finditer(pattern, text)]
+
+
 def draw_styled_lyrics_line(
     painter: QPainter,
     text: str,
@@ -245,8 +266,10 @@ def draw_styled_lyrics_line(
     stroke_w: float,
     shadow_alpha: int,
     opacity: float = 1.0,
+    highlight_terms: Optional[List[str]] = None,
+    highlight_color: Optional[QColor] = None,
 ) -> None:
-    """Renders cinema/lyrics typography with soft feathered multi-layer shadow, round vector stroke, and vertical gradient."""
+    """Renders cinema/lyrics typography with soft shadow, round vector stroke, vertical gradient, and optional glossary highlights."""
     if not text or opacity <= 0.01:
         return
     painter.save()
@@ -265,7 +288,7 @@ def draw_styled_lyrics_line(
         stroker.setCapStyle(Qt.PenCapStyle.RoundCap)
         outline_path = stroker.createStroke(path)
 
-    # Soft multi-offset shadow reusing outline_path (fast & feathered on both bright and dark scenes)
+    # Soft multi-offset shadow reusing outline_path
     if shadow_alpha > 0:
         painter.setPen(Qt.PenStyle.NoPen)
         base_shadow = outline_path if outline_path is not None else path
@@ -293,6 +316,27 @@ def draw_styled_lyrics_line(
     painter.setPen(Qt.PenStyle.NoPen)
     painter.setBrush(grad)
     painter.drawPath(path)
+
+    # Optional subtle glossary character/term accent highlight via kerning-exact clip overfill
+    spans = _find_highlight_spans(text, highlight_terms)
+    if spans:
+        fm = QFontMetricsF(font)
+        # Pick complementary soft highlight tint (champagne gold on cool/white themes; ice-sky on warm yellow theme)
+        if highlight_color is None:
+            is_warm_main = col_bot.red() > 235 and col_bot.blue() < 185
+            hl_col = QColor("#7DD3FC") if is_warm_main else QColor("#FDE68A")
+        else:
+            hl_col = highlight_color
+        painter.setBrush(hl_col)
+        for s_idx, e_idx in spans:
+            x0 = baseline.x() + fm.horizontalAdvance(text[:s_idx])
+            x1 = baseline.x() + fm.horizontalAdvance(text[:e_idx])
+            clip_r = QRectF(x0 - 0.5, baseline.y() - ascent - 3.0, max(2.0, x1 - x0 + 1.0), ascent + descent + 6.0)
+            painter.save()
+            painter.setClipRect(clip_r)
+            painter.drawPath(path)
+            painter.restore()
+
     painter.restore()
 
 
@@ -320,15 +364,16 @@ class LyricsVectorPreviewWidget(QWidget):
         bg = QLinearGradient(0.0, 0.0, r.width(), r.height())
         bg.setColorAt(0.0, QColor("#1E293B"))
         bg.setColorAt(0.55, QColor("#475569"))
-        bg.setColorAt(1.0, QColor("#94A3B8"))
+        bg.setColorAt(1.0, QColor("#CBD5E1"))
         p.fillRect(r, bg)
 
         st = self.cfg_mgr.config.style
-        px = min(28, max(16, int(st.base_font_size * 0.84)))
+        px = min(27, max(16, int(st.base_font_size * 0.82)))
         f_main = QFont(st.font_family)
         f_main.setPixelSize(px)
         f_main.setWeight(QFont.Weight.Bold if st.font_weight >= 650 else QFont.Weight.DemiBold)
         fm_m = QFontMetricsF(f_main)
+        hl_terms = list(self.cfg_mgr.glossary.values()) if st.highlight_glossary else None
 
         if st.display_mode == "danmaku":
             chips = [
@@ -364,6 +409,7 @@ class LyricsVectorPreviewWidget(QWidget):
                     QColor(st.stroke_color),
                     min(2.4, float(st.stroke_width)),
                     int(st.shadow_opacity * 0.7),
+                    highlight_terms=hl_terms,
                 )
                 p.restore()
                 y_bot -= ch_h + 8.0
@@ -387,31 +433,33 @@ class LyricsVectorPreviewWidget(QWidget):
         orig_w = fm_o.horizontalAdvance(orig_txt) if orig_txt else 0.0
         prev_w = fm_p.horizontalAdvance(prev_txt) if prev_txt else 0.0
 
-        block_h = fm_m.height() + (fm_o.height() + 4.0 if orig_txt else 0.0) + (fm_p.height() + 4.0 if prev_txt else 0.0)
+        active_h = fm_m.height() + (fm_o.height() + 4.0 if orig_txt else 0.0)
+        prev_h = (fm_p.height() + 6.0) if prev_txt else 0.0
         if st.anchor_bottom:
-            top_y = r.height() - block_h - 14.0
+            active_top = r.height() - active_h - 14.0
         else:
-            top_y = (r.height() - block_h) / 2.0
+            active_top = (r.height() - active_h) / 2.0 + (prev_h * 0.3)
 
-        if st.bg_opacity > 0:
+        eff_bg = int(st.bg_opacity)
+        if eff_bg > 0:
             bg_c = QColor(st.bg_color)
-            bg_c.setAlpha(int(st.bg_opacity))
+            bg_c.setAlpha(eff_bg)
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(bg_c)
             if st.fit_bg_to_text:
-                max_w = max(main_w, orig_w, prev_w)
-                pill = QRectF((r.width() - max_w) / 2.0 - 18.0, top_y - 6.0, max_w + 36.0, block_h + 12.0)
+                max_w = max(main_w, orig_w)
+                pill = QRectF((r.width() - max_w) / 2.0 - 18.0, active_top - 6.0, max_w + 36.0, active_h + 12.0)
                 p.drawRoundedRect(pill, float(st.bg_radius), float(st.bg_radius))
             else:
-                p.drawRoundedRect(QRectF(14.0, top_y - 6.0, r.width() - 28.0, block_h + 12.0), float(st.bg_radius), float(st.bg_radius))
+                p.drawRoundedRect(QRectF(14.0, active_top - 6.0, r.width() - 28.0, active_h + 12.0), float(st.bg_radius), float(st.bg_radius))
 
-        cur_y = top_y
         if prev_txt:
+            prev_y = active_top - prev_h - (8.0 if eff_bg > 0 else 1.0)
             draw_styled_lyrics_line(
                 p,
                 prev_txt,
                 f_prev,
-                QPointF((r.width() - prev_w) / 2.0, cur_y + fm_p.ascent()),
+                QPointF((r.width() - prev_w) / 2.0, prev_y + fm_p.ascent()),
                 fm_p.ascent(),
                 fm_p.descent(),
                 QColor("#E2E8F0"),
@@ -421,30 +469,17 @@ class LyricsVectorPreviewWidget(QWidget):
                 int(st.shadow_opacity * 0.65),
                 opacity=0.62,
             )
-            cur_y += fm_p.height() + 4.0
 
-        draw_styled_lyrics_line(
-            p,
-            main_txt,
-            f_main,
-            QPointF((r.width() - main_w) / 2.0, cur_y + fm_m.ascent()),
-            fm_m.ascent(),
-            fm_m.descent(),
-            QColor(st.color_top),
-            QColor(st.color_bottom),
-            QColor(st.stroke_color),
-            float(st.stroke_width) * 0.85,
-            int(st.shadow_opacity),
-        )
-        cur_y += fm_m.height() + 4.0
+        cur_y = active_top
+        orig_first = bool(orig_txt) and st.bilingual_order == "orig_top"
 
-        if orig_txt:
+        def _draw_prev_orig(y0: float) -> float:
             oc = QColor(st.orig_color)
             draw_styled_lyrics_line(
                 p,
                 orig_txt,
                 f_orig,
-                QPointF((r.width() - orig_w) / 2.0, cur_y + fm_o.ascent()),
+                QPointF((r.width() - orig_w) / 2.0, y0 + fm_o.ascent()),
                 fm_o.ascent(),
                 fm_o.descent(),
                 oc,
@@ -453,6 +488,32 @@ class LyricsVectorPreviewWidget(QWidget):
                 max(1.4, float(st.stroke_width) * 0.60),
                 int(st.shadow_opacity * 0.80),
             )
+            return y0 + fm_o.height() + 4.0
+
+        def _draw_prev_main(y0: float) -> float:
+            draw_styled_lyrics_line(
+                p,
+                main_txt,
+                f_main,
+                QPointF((r.width() - main_w) / 2.0, y0 + fm_m.ascent()),
+                fm_m.ascent(),
+                fm_m.descent(),
+                QColor(st.color_top),
+                QColor(st.color_bottom),
+                QColor(st.stroke_color),
+                float(st.stroke_width) * 0.85,
+                int(st.shadow_opacity),
+                highlight_terms=hl_terms,
+            )
+            return y0 + fm_m.height() + 4.0
+
+        if orig_first:
+            cur_y = _draw_prev_orig(cur_y)
+            _draw_prev_main(cur_y)
+        else:
+            cur_y = _draw_prev_main(cur_y)
+            if orig_txt:
+                _draw_prev_orig(cur_y)
 
 
 class LyricsStyleStudioWidget(QWidget):
@@ -460,6 +521,7 @@ class LyricsStyleStudioWidget(QWidget):
 
     style_changed = Signal()
     request_align_region = Signal(bool)  # False = snap above region, True = cover original hard-subs
+    request_reset_center = Signal()
 
     def __init__(self, cfg_mgr: ConfigManager, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -468,7 +530,7 @@ class LyricsStyleStudioWidget(QWidget):
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(14)
+        root.setSpacing(12)
 
         # True Vector Live Preview Banner
         self.preview_canvas = LyricsVectorPreviewWidget(self.cfg_mgr, self)
@@ -478,9 +540,9 @@ class LyricsStyleStudioWidget(QWidget):
         card = QFrame()
         card.setProperty("card", True)
         grid = QGridLayout(card)
-        grid.setContentsMargins(20, 16, 20, 16)
-        grid.setHorizontalSpacing(16)
-        grid.setVerticalSpacing(12)
+        grid.setContentsMargins(20, 14, 20, 14)
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(11)
 
         grid.addWidget(QLabel("预设主题"), 0, 0)
         self.preset_combo = QComboBox()
@@ -525,7 +587,7 @@ class LyricsStyleStudioWidget(QWidget):
         self.bg_slider = QSlider(Qt.Orientation.Horizontal)
         self.bg_slider.setRange(0, 235)
         self.bg_lbl = QLabel("全透明")
-        self.bg_lbl.setFixedWidth(56)
+        self.bg_lbl.setFixedWidth(52)
         self.bg_slider.valueChanged.connect(self._on_any_changed)
         bg_box.addWidget(self.bg_slider, 1)
         bg_box.addWidget(self.bg_lbl)
@@ -555,20 +617,32 @@ class LyricsStyleStudioWidget(QWidget):
         self.mode_combo.currentIndexChanged.connect(self._on_any_changed)
         grid.addWidget(self.mode_combo, 3, 1)
 
-        grid.addWidget(QLabel("快捷定位"), 3, 2)
+        grid.addWidget(QLabel("双语顺序"), 3, 2)
+        self.bi_order_combo = QComboBox()
+        self.bi_order_combo.addItem("译文在上 · 原文在下", "trans_top")
+        self.bi_order_combo.addItem("原文在上 · 译文在下", "orig_top")
+        self.bi_order_combo.currentIndexChanged.connect(self._on_any_changed)
+        grid.addWidget(self.bi_order_combo, 3, 3)
+
+        grid.addWidget(QLabel("快捷定位"), 4, 0)
         align_row = QHBoxLayout()
-        align_row.setSpacing(6)
-        btn_above = QPushButton("贴合上方")
+        align_row.setSpacing(8)
+        btn_above = QPushButton("贴合原字幕上方")
         btn_above.setToolTip("自动对齐到已框选原字幕区域的正上方")
         btn_above.clicked.connect(lambda: self.request_align_region.emit(False))
-        btn_cover = QPushButton("遮盖原字幕")
+        btn_cover = QPushButton("遮盖原硬字幕")
         btn_cover.setToolTip("直接覆盖在原硬字幕上方并自动开启防重复识别底板")
         btn_cover.clicked.connect(lambda: self.request_align_region.emit(True))
+        btn_center = QPushButton("复位底部居中")
+        btn_center.setToolTip("重置悬浮字幕到主屏底部正中央")
+        btn_center.clicked.connect(self.request_reset_center.emit)
         align_row.addWidget(btn_above)
         align_row.addWidget(btn_cover)
-        grid.addLayout(align_row, 3, 3)
+        align_row.addWidget(btn_center)
+        align_row.addStretch()
+        grid.addLayout(align_row, 4, 1, 1, 3)
 
-        grid.addWidget(QLabel("颜色配置"), 4, 0)
+        grid.addWidget(QLabel("颜色配置"), 5, 0)
         color_row = QHBoxLayout()
         color_row.setSpacing(8)
         self.btn_col_top = QPushButton("主字色")
@@ -581,29 +655,38 @@ class LyricsStyleStudioWidget(QWidget):
         self.btn_col_orig.clicked.connect(lambda: self._pick_color("orig_color"))
         for b in (self.btn_col_top, self.btn_col_bot, self.btn_col_stroke, self.btn_col_orig):
             color_row.addWidget(b)
-        grid.addLayout(color_row, 4, 1, 1, 3)
+        grid.addLayout(color_row, 5, 1, 1, 3)
 
         toggles_1 = QHBoxLayout()
-        toggles_1.setSpacing(18)
+        toggles_1.setSpacing(16)
         self.auto_scale_chk = QCheckBox("长句自动缩放")
         self.bilingual_chk = QCheckBox("显示双语对照")
-        self.keep_prev_chk = QCheckBox("保留上一句（防语速太快）")
-        for chk in (self.auto_scale_chk, self.bilingual_chk, self.keep_prev_chk):
+        self.keep_prev_chk = QCheckBox("保留上一句防漏看")
+        self.hl_glossary_chk = QCheckBox("词表角色名高亮")
+        for chk in (self.auto_scale_chk, self.bilingual_chk, self.keep_prev_chk, self.hl_glossary_chk):
             chk.toggled.connect(self._on_any_changed)
             toggles_1.addWidget(chk)
         toggles_1.addStretch()
-        grid.addLayout(toggles_1, 5, 0, 1, 4)
+        grid.addLayout(toggles_1, 6, 0, 1, 4)
 
         toggles_2 = QHBoxLayout()
-        toggles_2.setSpacing(18)
-        self.fit_bg_chk = QCheckBox("底板贴合文字宽度")
+        toggles_2.setSpacing(16)
+        self.fit_bg_chk = QCheckBox("底板贴合文字")
         self.anchor_bot_chk = QCheckBox("底部锚定防跳动")
-        self.exclude_chk = QCheckBox("防重复识别（可直接盖住原字幕）")
-        for chk in (self.fit_bg_chk, self.anchor_bot_chk, self.exclude_chk):
+        self.auto_contrast_chk = QCheckBox("亮画面自动补底板")
+        self.alt_unlock_chk = QCheckBox("穿透时按住 Alt 交互")
+        for chk in (self.fit_bg_chk, self.anchor_bot_chk, self.auto_contrast_chk, self.alt_unlock_chk):
             chk.toggled.connect(self._on_any_changed)
             toggles_2.addWidget(chk)
         toggles_2.addStretch()
-        grid.addLayout(toggles_2, 6, 0, 1, 4)
+        grid.addLayout(toggles_2, 7, 0, 1, 4)
+
+        toggles_3 = QHBoxLayout()
+        self.exclude_chk = QCheckBox("防重复识别（开启后悬浮字幕可直接盖住原外语字幕，不影响 OCR 抓词）")
+        self.exclude_chk.toggled.connect(self._on_any_changed)
+        toggles_3.addWidget(self.exclude_chk)
+        toggles_3.addStretch()
+        grid.addLayout(toggles_3, 8, 0, 1, 4)
 
         root.addWidget(card)
         self.sync_from_config()
@@ -620,13 +703,19 @@ class LyricsStyleStudioWidget(QWidget):
         m_idx = self.mode_combo.findData(st.display_mode)
         if m_idx >= 0:
             self.mode_combo.setCurrentIndex(m_idx)
+        bo_idx = self.bi_order_combo.findData(st.bilingual_order)
+        if bo_idx >= 0:
+            self.bi_order_combo.setCurrentIndex(bo_idx)
         self.size_slider.setValue(int(st.base_font_size))
         self.size_val_lbl.setText(f"{int(st.base_font_size)} px")
         self.auto_scale_chk.setChecked(bool(st.auto_scale_font))
         self.bilingual_chk.setChecked(bool(st.bilingual))
         self.keep_prev_chk.setChecked(bool(st.keep_prev_line))
+        self.hl_glossary_chk.setChecked(bool(st.highlight_glossary))
         self.fit_bg_chk.setChecked(bool(st.fit_bg_to_text))
         self.anchor_bot_chk.setChecked(bool(st.anchor_bottom))
+        self.auto_contrast_chk.setChecked(bool(st.auto_contrast_bg))
+        self.alt_unlock_chk.setChecked(bool(st.alt_temp_unlock))
         self.stroke_slider.setValue(int(round(float(st.stroke_width) * 10)))
         self.stroke_val_lbl.setText(f"{float(st.stroke_width):.1f} px")
         self.shadow_slider.setValue(int(st.shadow_opacity))
@@ -683,13 +772,17 @@ class LyricsStyleStudioWidget(QWidget):
         st = self.cfg_mgr.config.style
         st.font_family = self.font_combo.currentText()
         st.display_mode = str(self.mode_combo.currentData() or "subtitle")
+        st.bilingual_order = str(self.bi_order_combo.currentData() or "trans_top")
         st.base_font_size = int(self.size_slider.value())
         self.size_val_lbl.setText(f"{st.base_font_size} px")
         st.auto_scale_font = self.auto_scale_chk.isChecked()
         st.bilingual = self.bilingual_chk.isChecked()
         st.keep_prev_line = self.keep_prev_chk.isChecked()
+        st.highlight_glossary = self.hl_glossary_chk.isChecked()
         st.fit_bg_to_text = self.fit_bg_chk.isChecked()
         st.anchor_bottom = self.anchor_bot_chk.isChecked()
+        st.auto_contrast_bg = self.auto_contrast_chk.isChecked()
+        st.alt_temp_unlock = self.alt_unlock_chk.isChecked()
         st.stroke_width = round(self.stroke_slider.value() / 10.0, 1)
         self.stroke_val_lbl.setText(f"{st.stroke_width:.1f} px")
         st.shadow_opacity = int(self.shadow_slider.value())
@@ -704,10 +797,10 @@ class LyricsStyleStudioWidget(QWidget):
 class LyricsSubtitleWindow(QWidget):
     """
     Cinema/Desktop-Lyrics Floating Subtitle & Lightweight Danmaku Overlay:
-    - Smooth 150ms fade-in + subtle upward glide & 300ms graceful fade-out
-    - Fit-content adaptive rounded capsule backdrop (never giant empty bars for short lines)
-    - Bottom-anchored anti-jitter typography + optional faded previous-line retention
-    - Lightweight danmaku floating stream mode + mouse-wheel font zoom + freeze-line + 1-click copy
+    - Smooth fade-in/out + upward glide + streaming voice breathing indicator
+    - Auto-contrast backdrop on bright scenes + fit-content capsule + bottom-anchored layout
+    - Inline history scrubbing (‹ › & Shift+Wheel) + magnetic horizontal center snap + hold-Alt temp unlock
+    - Bilingual top/bottom swap + non-truncated 2-line original wrap + glossary character highlight
     """
 
     request_edit = Signal()
@@ -716,6 +809,7 @@ class LyricsSubtitleWindow(QWidget):
     request_mark_region = Signal()
     request_open_panel = Signal()
     lock_state_changed = Signal(bool)
+    _luma_sampled = Signal(float)
 
     def __init__(self, cfg_mgr: ConfigManager) -> None:
         super().__init__(None)
@@ -725,22 +819,31 @@ class LyricsSubtitleWindow(QWidget):
         self._prev_translated_text = ""
         self._prev_opacity = 0.0
         self._danmaku_items: List[Dict[str, object]] = []
+        self._history_ring: List[Tuple[str, str]] = []
+        self._browse_idx: int = -1  # -1 = live latest; >= 0 = scrubbing history
         self._toast_text = ""
 
         self._hovered = False
         self._auto_hidden = False
         self._frozen = False
+        self._is_preview = False
+        self._preview_phase = 0.0
+        self._temp_unlocked = False
+        self._snap_center_guide = False
         self._dragging = False
         self._resizing = False
         self._drag_offset = QPoint()
         self._resize_origin_pos = QPoint()
         self._resize_origin_size = self.size()
 
-        # Animation state (timer runs only while easing so idle CPU is 0%)
+        # Smooth animation & auto-contrast state (timer stops when idle so 0% CPU)
         self._cur_opacity = 1.0
         self._target_opacity = 1.0
         self._slide_offset = 0.0
         self._prev_target_opacity = 0.0
+        self._auto_bg_alpha = 0.0
+        self._target_auto_bg_alpha = 0.0
+        self._luma_busy = False
 
         self.setWindowTitle("轻译悬浮字幕")
         self.setWindowFlags(
@@ -749,10 +852,11 @@ class LyricsSubtitleWindow(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         self.setMouseTracking(True)
-        self.setMinimumSize(420, 118)
+        self.setMinimumSize(440, 122)
 
         self._init_geometry()
         self._build_hover_toolbar()
+        self._luma_sampled.connect(self._on_luma_sampled)
 
         self._hide_bar_timer = QTimer(self)
         self._hide_bar_timer.setSingleShot(True)
@@ -771,21 +875,57 @@ class LyricsSubtitleWindow(QWidget):
         self._prev_clear_timer.timeout.connect(self._fade_out_prev_line)
 
         self._anim_timer = QTimer(self)
-        self._anim_timer.setInterval(25)  # ~40fps smooth easing
+        self._anim_timer.setInterval(25)
         self._anim_timer.timeout.connect(self._step_animation)
+
+        # Ultra-light 850ms backdrop brightness sampler (reads <150px behind overlay via WDA-invisible capture)
+        self._luma_timer = QTimer(self)
+        self._luma_timer.setInterval(850)
+        self._luma_timer.timeout.connect(self._schedule_luma_sample)
+        self._luma_timer.start()
+
+        # Lightweight hold-Alt temporary unlock watcher (only runs while click-through lock is active!)
+        self._alt_timer = QTimer(self)
+        self._alt_timer.setInterval(110)
+        self._alt_timer.timeout.connect(self._poll_alt_temp_unlock)
+
+    def _is_interaction_locked(self) -> bool:
+        return bool(self.cfg_mgr.config.style.locked_click_through) and not self._temp_unlocked
 
     def _init_geometry(self) -> None:
         st = self.cfg_mgr.config.style
         screen = QGuiApplication.primaryScreen()
         s_geo = screen.availableGeometry() if screen else QRect(0, 0, 1920, 1080)
         w = max(460, min(st.overlay_width, s_geo.width() - 60))
-        h = max(132, min(st.overlay_height, 360))
+        h = max(136, min(st.overlay_height, 360))
         if st.overlay_x < 0 or st.overlay_y < 0:
             x = s_geo.x() + (s_geo.width() - w) // 2
             y = s_geo.y() + s_geo.height() - h - 50
         else:
             x, y = st.overlay_x, st.overlay_y
+            # Multi-monitor / resolution-change off-screen guard
+            union = QRect()
+            for scr in QGuiApplication.screens():
+                union = union.united(scr.availableGeometry())
+            if not union.isNull() and not union.intersects(QRect(x + 40, y + 20, max(40, w - 80), max(40, h - 40))):
+                x = s_geo.x() + (s_geo.width() - w) // 2
+                y = s_geo.y() + s_geo.height() - h - 50
         self.setGeometry(x, y, w, h)
+
+    def reset_position_center(self) -> None:
+        """Resets subtitle cleanly to primary screen bottom horizontal center."""
+        st = self.cfg_mgr.config.style
+        screen = QGuiApplication.primaryScreen()
+        s_geo = screen.availableGeometry() if screen else QRect(0, 0, 1920, 1080)
+        w = max(460, min(self.width(), s_geo.width() - 60))
+        h = max(136, min(self.height(), 360))
+        x = s_geo.x() + (s_geo.width() - w) // 2
+        y = s_geo.y() + s_geo.height() - h - 50
+        self.setGeometry(x, y, w, h)
+        st.overlay_x, st.overlay_y, st.overlay_width, st.overlay_height = x, y, w, h
+        self.cfg_mgr.save()
+        self.show_toast("字幕已复位到底部居中", 1500)
+        self.update()
 
     def _build_hover_toolbar(self) -> None:
         self.toolbar = QFrame(self)
@@ -793,7 +933,7 @@ class LyricsSubtitleWindow(QWidget):
         self.toolbar.setStyleSheet(
             """
             QFrame#lyricsHoverBar {
-                background-color: rgba(255, 255, 255, 240);
+                background-color: rgba(255, 255, 255, 242);
                 border: 1px solid #CBD5E1;
                 border-radius: 13px;
             }
@@ -802,7 +942,7 @@ class LyricsSubtitleWindow(QWidget):
                 color: #334155;
                 border: none;
                 border-radius: 7px;
-                padding: 3px 9px;
+                padding: 3px 8px;
                 font-size: 12px;
                 font-weight: 600;
             }
@@ -813,15 +953,30 @@ class LyricsSubtitleWindow(QWidget):
             """
         )
         bar_lay = QHBoxLayout(self.toolbar)
-        bar_lay.setContentsMargins(10, 3, 10, 3)
-        bar_lay.setSpacing(3)
+        bar_lay.setContentsMargins(8, 3, 8, 3)
+        bar_lay.setSpacing(2)
+
+        btn_prev_hist = QPushButton("‹")
+        btn_prev_hist.setToolTip("回看上一句历史台词（也可 Shift + 滚轮）")
+        btn_prev_hist.setFixedWidth(24)
+        btn_prev_hist.clicked.connect(lambda: self._browse_history(-1))
+
+        btn_next_hist = QPushButton("›")
+        btn_next_hist.setToolTip("前进到下一句或恢复最新")
+        btn_next_hist.setFixedWidth(24)
+        btn_next_hist.clicked.connect(lambda: self._browse_history(1))
+
+        self.btn_back_live = QPushButton("回最新")
+        self.btn_back_live.setStyleSheet("background-color: #EFF6FF; color: #2563EB;")
+        self.btn_back_live.clicked.connect(self._exit_history_browse)
+        self.btn_back_live.hide()
 
         btn_copy = QPushButton("复制")
-        btn_copy.setToolTip("复制当前译文到剪贴板")
+        btn_copy.setToolTip("复制当前译文（也可右键单击字幕）")
         btn_copy.clicked.connect(self.copy_current_subtitle)
 
         self.btn_freeze = QPushButton("冻住")
-        self.btn_freeze.setToolTip("冻结当前字幕，防止下一句顶掉，方便阅读或查词")
+        self.btn_freeze.setToolTip("冻结当前字幕，防止下一句顶掉")
         self.btn_freeze.clicked.connect(self.toggle_frozen)
 
         btn_bi = QPushButton("双语")
@@ -834,6 +989,7 @@ class LyricsSubtitleWindow(QWidget):
         btn_edit.clicked.connect(self.request_edit.emit)
 
         btn_lock = QPushButton("穿透")
+        btn_lock.setToolTip("开启鼠标穿透（锁定后按住 Alt 可临时唤醒交互）")
         btn_lock.clicked.connect(lambda: self.set_locked(True))
 
         btn_panel = QPushButton("面板")
@@ -842,11 +998,136 @@ class LyricsSubtitleWindow(QWidget):
         btn_hide = QPushButton("隐藏")
         btn_hide.clicked.connect(self.hide)
 
-        for b in (btn_copy, self.btn_freeze, btn_bi, btn_preset, btn_edit, btn_lock, btn_panel, btn_hide):
+        for b in (
+            btn_prev_hist,
+            btn_next_hist,
+            self.btn_back_live,
+            btn_copy,
+            self.btn_freeze,
+            btn_bi,
+            btn_preset,
+            btn_edit,
+            btn_lock,
+            btn_panel,
+            btn_hide,
+        ):
             bar_lay.addWidget(b)
 
         self.toolbar.adjustSize()
         self.toolbar.hide()
+
+    def _browse_history(self, step: int) -> None:
+        if not self._history_ring:
+            self.show_toast("暂无历史台词可回看", 1100)
+            return
+        total = len(self._history_ring)
+        if self._browse_idx < 0:
+            if step > 0:
+                return
+            self._browse_idx = max(0, total - 2) if total >= 2 else 0
+        else:
+            nxt = self._browse_idx + step
+            if nxt >= total:
+                self._exit_history_browse()
+                return
+            self._browse_idx = max(0, nxt)
+
+        orig, trans = self._history_ring[self._browse_idx]
+        self._original_text = orig
+        self._translated_text = trans
+        self._is_preview = False
+        self._auto_hidden = False
+        self._cur_opacity = 1.0
+        self._target_opacity = 1.0
+        self._auto_hide_timer.stop()
+        self.btn_back_live.setVisible(True)
+        self._reposition_toolbar()
+        self.show_toast(f"回看历史 {self._browse_idx + 1} / {total}", 1200)
+        self.update()
+
+    def _exit_history_browse(self) -> None:
+        self._browse_idx = -1
+        self.btn_back_live.setVisible(False)
+        self._reposition_toolbar()
+        if self._history_ring:
+            orig, trans = self._history_ring[-1]
+            self._original_text = orig
+            self._translated_text = trans
+        self._restart_auto_hide_timer()
+        self.show_toast("已回到实时最新台词", 1100)
+        self.update()
+
+    def _poll_alt_temp_unlock(self) -> None:
+        st = self.cfg_mgr.config.style
+        if not st.locked_click_through or not st.alt_temp_unlock or not self.isVisible():
+            if self._temp_unlocked:
+                self._temp_unlocked = False
+                set_window_click_through(int(self.winId()), bool(st.locked_click_through))
+            self._alt_timer.stop()
+            return
+
+        alt_down = is_alt_key_pressed()
+        cursor_near = self.geometry().adjusted(-24, -24, 24, 24).contains(QCursor.pos())
+        if alt_down and cursor_near:
+            if not self._temp_unlocked:
+                self._temp_unlocked = True
+                set_window_click_through(int(self.winId()), False)
+                self._hovered = True
+                self._auto_hidden = False
+                self._target_opacity = 1.0
+                self._ensure_anim_running()
+                self._reposition_toolbar()
+                self.toolbar.show()
+                self.show_toast("已临时唤醒交互（松开 Alt 恢复穿透）", 1500)
+                self.update()
+        elif self._temp_unlocked and not alt_down and not self._dragging and not self._resizing:
+            self._temp_unlocked = False
+            self._hovered = False
+            self.toolbar.hide()
+            set_window_click_through(int(self.winId()), True)
+            self._restart_auto_hide_timer()
+            self.update()
+
+    def _schedule_luma_sample(self) -> None:
+        st = self.cfg_mgr.config.style
+        if not st.auto_contrast_bg or not self.isVisible() or (self._auto_hidden and not self._hovered):
+            if self._target_auto_bg_alpha > 0.0:
+                self._target_auto_bg_alpha = 0.0
+                self._ensure_anim_running()
+            return
+        if self._luma_busy:
+            return
+        # Sample only the lower subtitle strip (WDA_EXCLUDEFROMCAPTURE keeps our own overlay invisible!)
+        geo = self.geometry()
+        sample_rect = QRect(geo.x() + 24, geo.y() + max(36, geo.height() // 2), max(40, geo.width() - 48), max(24, geo.height() // 2 - 8))
+        px, py, pw, ph, _ = logical_rect_to_physical(sample_rect)
+        self._luma_busy = True
+
+        def job() -> None:
+            cap = FastWin32ScreenCapturer()
+            try:
+                bgr = cap.grab_bgr(px, py, pw, ph, max_side=24)
+                if bgr is not None and bgr.size > 0:
+                    # Fast Rec.601 average luminance (0..255) over tiny ~24x6 patch
+                    luma = float(0.114 * bgr[:, :, 0].mean() + 0.587 * bgr[:, :, 1].mean() + 0.299 * bgr[:, :, 2].mean())
+                    self._luma_sampled.emit(luma)
+            finally:
+                cap.close()
+                self._luma_busy = False
+
+        threading.Thread(target=job, daemon=True, name="SubLumaProbe").start()
+
+    def _on_luma_sampled(self, luma: float) -> None:
+        if not self.cfg_mgr.config.style.auto_contrast_bg:
+            target = 0.0
+        elif luma >= 152.0:
+            # Bright snow / sky / white PPT scene -> smoothly bring in soft protective frosted dark pill
+            target = min(162.0, 72.0 + (luma - 152.0) * 1.15)
+        else:
+            target = 0.0
+        if abs(target - self._target_auto_bg_alpha) > 6.0:
+            self._target_auto_bg_alpha = target
+            self._ensure_anim_running()
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
@@ -866,8 +1147,15 @@ class LyricsSubtitleWindow(QWidget):
         hwnd = int(self.winId())
         st = self.cfg_mgr.config.style
         set_exclude_from_capture(hwnd, bool(st.exclude_from_capture))
-        set_window_click_through(hwnd, bool(st.locked_click_through))
-        if st.locked_click_through:
+        eff_locked = bool(st.locked_click_through) and not self._temp_unlocked
+        set_window_click_through(hwnd, eff_locked)
+        if st.locked_click_through and st.alt_temp_unlock:
+            if not self._alt_timer.isActive():
+                self._alt_timer.start()
+        else:
+            self._alt_timer.stop()
+            self._temp_unlocked = False
+        if eff_locked:
             self._hovered = False
             self.toolbar.hide()
         self.update()
@@ -923,33 +1211,53 @@ class LyricsSubtitleWindow(QWidget):
         else:
             self.btn_freeze.setText("冻住")
             self.btn_freeze.setStyleSheet("")
-            self._restart_auto_hide_timer()
-            self.show_toast("已恢复实时更新", 1200)
+            if self._browse_idx >= 0:
+                self._exit_history_browse()
+            else:
+                self._restart_auto_hide_timer()
+                self.show_toast("已恢复实时更新", 1200)
         self.update()
 
     def set_subtitle(self, original: str, translated: str, force: bool = False, is_preview: bool = False) -> None:
-        if self._frozen and not force:
-            return
         new_orig = (original or "").strip()
         new_trans = (translated or "").strip()
         if not new_trans:
             return
 
+        # Record final sentences into inline history ring even while user is scrubbing/frozen
+        if not is_preview and not new_trans.startswith("悬浮字幕已就绪"):
+            if not self._history_ring or self._history_ring[-1][1] != new_trans:
+                self._history_ring.append((new_orig, new_trans))
+                self._history_ring = self._history_ring[-25:]
+
+        if (self._frozen or self._browse_idx >= 0) and not force:
+            return
+
         if is_preview:
-            # Smooth in-place streaming update while speaker is still talking (zero slide bounce, no history pollution)
+            # Smooth in-place streaming preview with subtle breathing indicator (no bounce, no history spam)
             self._original_text = new_orig
             self._translated_text = new_trans
+            self._is_preview = True
             self._auto_hidden = False
             self._cur_opacity = 1.0
             self._target_opacity = 1.0
             self._slide_offset = 0.0
+            self._ensure_anim_running()
             self._restart_auto_hide_timer()
             self.update()
             return
 
         old_trans = self._translated_text
+        was_preview = self._is_preview
+        self._is_preview = False
         is_placeholder = old_trans.startswith("悬浮字幕已就绪")
-        if new_trans != old_trans and old_trans and not is_placeholder and self.cfg_mgr.config.style.keep_prev_line:
+        if (
+            new_trans != old_trans
+            and old_trans
+            and not is_placeholder
+            and not was_preview
+            and self.cfg_mgr.config.style.keep_prev_line
+        ):
             self._prev_translated_text = old_trans
             self._prev_opacity = 0.62
             self._prev_target_opacity = 0.62
@@ -965,17 +1273,22 @@ class LyricsSubtitleWindow(QWidget):
             self._danmaku_items.append({"text": new_trans, "orig": new_orig, "born": now})
             self._danmaku_items = self._danmaku_items[-3:]
 
-        # Smooth 150ms fade-in + subtle 7px upward glide
-        self._cur_opacity = max(0.20, self._cur_opacity * 0.45) if self._cur_opacity > 0.1 else 0.05
+        # Smooth 150ms fade-in + subtle upward glide (skip bounce when seamlessly finalizing a live preview)
+        if was_preview:
+            self._cur_opacity = 1.0
+            self._slide_offset = 0.0
+        else:
+            self._cur_opacity = max(0.20, self._cur_opacity * 0.45) if self._cur_opacity > 0.1 else 0.05
+            self._slide_offset = 7.0
         self._target_opacity = 1.0
-        self._slide_offset = 7.0
         self._ensure_anim_running()
         self._restart_auto_hide_timer()
         self.update()
 
     def clear_for_empty_scene(self) -> None:
-        if not self._hovered and not self._dragging and not self._frozen and self.cfg_mgr.config.auto_hide_seconds > 0:
+        if not self._hovered and not self._dragging and not self._frozen and self._browse_idx < 0 and self.cfg_mgr.config.auto_hide_seconds > 0:
             self._auto_hidden = True
+            self._is_preview = False
             self._target_opacity = 0.0
             self._prev_target_opacity = 0.0
             self._ensure_anim_running()
@@ -990,7 +1303,6 @@ class LyricsSubtitleWindow(QWidget):
 
     def _step_animation(self) -> None:
         changed = False
-        # Main subtitle opacity easing (~150ms fade-in, ~300ms fade-out)
         if abs(self._cur_opacity - self._target_opacity) > 0.015:
             step = 0.16 if self._target_opacity > self._cur_opacity else 0.085
             if self._target_opacity > self._cur_opacity:
@@ -1001,14 +1313,12 @@ class LyricsSubtitleWindow(QWidget):
         else:
             self._cur_opacity = self._target_opacity
 
-        # Gentle upward glide
         if self._slide_offset > 0.25:
             self._slide_offset *= 0.62
             changed = True
         else:
             self._slide_offset = 0.0
 
-        # Previous line soft fade-out
         if abs(self._prev_opacity - self._prev_target_opacity) > 0.015:
             if self._prev_target_opacity < self._prev_opacity:
                 self._prev_opacity = max(0.0, self._prev_opacity - 0.055)
@@ -1020,20 +1330,34 @@ class LyricsSubtitleWindow(QWidget):
         else:
             self._prev_opacity = self._prev_target_opacity
 
+        # Smooth auto-contrast backdrop easing
+        if abs(self._auto_bg_alpha - self._target_auto_bg_alpha) > 1.5:
+            diff = self._target_auto_bg_alpha - self._auto_bg_alpha
+            self._auto_bg_alpha += diff * 0.22
+            changed = True
+        else:
+            self._auto_bg_alpha = self._target_auto_bg_alpha
+
+        # Gentle breathing pulse while streaming voice preview is active
+        if self._is_preview and self._cur_opacity > 0.05:
+            self._preview_phase = (self._preview_phase + 0.16) % (math.pi * 2.0)
+            changed = True
+
         self.update()
         if not changed:
             self._anim_timer.stop()
 
     def _restart_auto_hide_timer(self) -> None:
         sec = int(self.cfg_mgr.config.auto_hide_seconds)
-        if sec > 0 and self._translated_text and not self._frozen:
+        if sec > 0 and self._translated_text and not self._frozen and self._browse_idx < 0:
             self._auto_hide_timer.start(sec * 1000)
         else:
             self._auto_hide_timer.stop()
 
     def _on_auto_hide_timeout(self) -> None:
-        if not self._hovered and not self._dragging and not self._frozen and self.cfg_mgr.config.auto_hide_seconds > 0:
+        if not self._hovered and not self._dragging and not self._frozen and self._browse_idx < 0 and self.cfg_mgr.config.auto_hide_seconds > 0:
             self._auto_hidden = True
+            self._is_preview = False
             self._target_opacity = 0.0
             self._prev_target_opacity = 0.0
             self._ensure_anim_running()
@@ -1054,9 +1378,11 @@ class LyricsSubtitleWindow(QWidget):
         self.cfg_mgr.config.style.locked_click_through = locked
         self.cfg_mgr.save()
         if locked:
-            self.show_toast("已开启鼠标穿透，可在迷你悬浮条或主面板解锁", 2200)
+            tip = "已开启鼠标穿透（按住 Alt 移到字幕上可临时交互）" if self.cfg_mgr.config.style.alt_temp_unlock else "已开启鼠标穿透，可在迷你悬浮条或主面板解锁"
+            self.show_toast(tip, 2400)
         else:
-            self.show_toast("字幕已解锁（支持滚轮调字号）", 1500)
+            self._temp_unlocked = False
+            self.show_toast("字幕已解锁（滚轮调字号 · Shift+滚轮翻历史）", 1800)
         self.apply_native_window_flags()
         self.lock_state_changed.emit(locked)
 
@@ -1083,18 +1409,25 @@ class LyricsSubtitleWindow(QWidget):
         self.update()
 
     def wheelEvent(self, event) -> None:
-        if not self.cfg_mgr.config.style.locked_click_through:
+        if not self._is_interaction_locked():
             delta = event.angleDelta().y()
-            if delta > 0:
-                self._step_font(2)
-            elif delta < 0:
-                self._step_font(-2)
+            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                # Shift + Mouse Wheel scrubs recent subtitle history inline!
+                if delta > 0:
+                    self._browse_history(-1)
+                elif delta < 0:
+                    self._browse_history(1)
+            else:
+                if delta > 0:
+                    self._step_font(2)
+                elif delta < 0:
+                    self._step_font(-2)
             event.accept()
             return
         super().wheelEvent(event)
 
     def enterEvent(self, event) -> None:
-        if not self.cfg_mgr.config.style.locked_click_through:
+        if not self._is_interaction_locked():
             self._hovered = True
             self._auto_hidden = False
             self._target_opacity = 1.0
@@ -1116,14 +1449,14 @@ class LyricsSubtitleWindow(QWidget):
             self.update()
 
     def mouseDoubleClickEvent(self, event) -> None:
-        if event.button() == Qt.MouseButton.LeftButton and not self.cfg_mgr.config.style.locked_click_through:
+        if event.button() == Qt.MouseButton.LeftButton and not self._is_interaction_locked():
             self.request_edit.emit()
             event.accept()
             return
         super().mouseDoubleClickEvent(event)
 
     def mousePressEvent(self, event) -> None:
-        if self.cfg_mgr.config.style.locked_click_through:
+        if self._is_interaction_locked():
             return
         if event.button() == Qt.MouseButton.RightButton:
             self.copy_current_subtitle()
@@ -1141,7 +1474,7 @@ class LyricsSubtitleWindow(QWidget):
             event.accept()
 
     def mouseMoveEvent(self, event) -> None:
-        if self.cfg_mgr.config.style.locked_click_through:
+        if self._is_interaction_locked():
             return
         pos = event.position().toPoint()
         if self._resizing:
@@ -1152,7 +1485,20 @@ class LyricsSubtitleWindow(QWidget):
             event.accept()
             return
         if self._dragging:
-            self.move(event.globalPosition().toPoint() - self._drag_offset)
+            raw_pt = event.globalPosition().toPoint() - self._drag_offset
+            nx, ny = raw_pt.x(), raw_pt.y()
+            # Magnetic horizontal center snap (±18 px)
+            scr = QGuiApplication.screenAt(event.globalPosition().toPoint()) or QGuiApplication.primaryScreen()
+            if scr is not None:
+                s_geo = scr.availableGeometry()
+                center_x = s_geo.x() + (s_geo.width() - self.width()) // 2
+                if abs(nx - center_x) <= 18:
+                    nx = center_x
+                    self._snap_center_guide = True
+                else:
+                    self._snap_center_guide = False
+            self.move(nx, ny)
+            self.update()
             event.accept()
             return
         if pos.x() >= self.width() - 24 and pos.y() >= self.height() - 24:
@@ -1164,12 +1510,14 @@ class LyricsSubtitleWindow(QWidget):
         if self._dragging or self._resizing:
             self._dragging = False
             self._resizing = False
+            self._snap_center_guide = False
             st = self.cfg_mgr.config.style
             st.overlay_x = self.x()
             st.overlay_y = self.y()
             st.overlay_width = self.width()
             st.overlay_height = self.height()
             self.cfg_mgr.save()
+            self.update()
         super().mouseReleaseEvent(event)
 
     @staticmethod
@@ -1242,11 +1590,10 @@ class LyricsSubtitleWindow(QWidget):
         )
 
         st = self.cfg_mgr.config.style
-        # Always reserve a stable top strip for the hover bar so hovering NEVER causes subtitles to jump vertically!
         top_pad = 36.0
         content_rect = QRectF(14.0, top_pad, max(80.0, self.width() - 28.0), max(54.0, self.height() - top_pad - 8.0))
 
-        if self._hovered and not st.locked_click_through:
+        if self._hovered and not self._is_interaction_locked():
             hover_pen = QPen(QColor(59, 130, 246, 135), 1.2, Qt.PenStyle.DashLine)
             painter.setPen(hover_pen)
             painter.setBrush(QColor(255, 255, 255, 22))
@@ -1256,6 +1603,12 @@ class LyricsSubtitleWindow(QWidget):
             w, h = self.width(), self.height()
             painter.drawLine(w - 16, h - 6, w - 6, h - 16)
             painter.drawLine(w - 11, h - 6, w - 6, h - 11)
+
+        # Tactile blue dashed vertical center snap guideline while dragging to screen center
+        if self._snap_center_guide and self._dragging:
+            cx = self.width() / 2.0
+            painter.setPen(QPen(QColor(59, 130, 246, 200), 1.6, Qt.PenStyle.DashLine))
+            painter.drawLine(QPointF(cx, top_pad), QPointF(cx, self.height() - 6.0))
 
         if self._cur_opacity > 0.01 or self._hovered:
             draw_op = 1.0 if self._hovered else self._cur_opacity
@@ -1291,9 +1644,9 @@ class LyricsSubtitleWindow(QWidget):
         dm_font.setPixelSize(dm_px)
         dm_font.setWeight(QFont.Weight.Bold if st.font_weight >= 650 else QFont.Weight.DemiBold)
         fm = QFontMetricsF(dm_font)
+        hl_terms = list(self.cfg_mgr.glossary.values()) if st.highlight_glossary else None
 
         y_bottom = content_rect.bottom() - 4.0 + self._slide_offset
-        n = len(items)
         for idx, item in enumerate(reversed(items)):
             txt = str(item["text"])
             elided = fm.elidedText(txt, Qt.TextElideMode.ElideRight, avail_w)
@@ -1310,7 +1663,7 @@ class LyricsSubtitleWindow(QWidget):
             painter.save()
             painter.setOpacity(tier_op)
             bg_c = QColor(st.bg_color)
-            bg_c.setAlpha(max(138, int(st.bg_opacity)))
+            bg_c.setAlpha(max(138, int(st.bg_opacity), int(round(self._auto_bg_alpha)) if st.auto_contrast_bg else 0))
             painter.setPen(QPen(QColor(255, 255, 255, 45), 1.0))
             painter.setBrush(bg_c)
             painter.drawRoundedRect(pill_rect, pill_h / 2.0, pill_h / 2.0)
@@ -1329,6 +1682,7 @@ class LyricsSubtitleWindow(QWidget):
                 QColor(st.stroke_color),
                 min(2.4, float(st.stroke_width)),
                 int(st.shadow_opacity * 0.72),
+                highlight_terms=hl_terms,
             )
             painter.restore()
             y_bottom = pill_top - 8.0
@@ -1341,6 +1695,7 @@ class LyricsSubtitleWindow(QWidget):
         orig_txt = self._original_text if (st.bilingual and self._original_text and self._original_text != trans_txt) else ""
         show_prev = (
             st.keep_prev_line
+            and self._browse_idx < 0
             and bool(self._prev_translated_text)
             and self._prev_opacity > 0.02
             and self._prev_translated_text != trans_txt
@@ -1348,7 +1703,16 @@ class LyricsSubtitleWindow(QWidget):
 
         avail_w = max(120.0, content_rect.width() - 40.0)
         orig_px = max(13, int(round(st.base_font_size * st.orig_font_scale)))
-        orig_reserve_h = (orig_px * 1.45) if orig_txt else 0.0
+        orig_font = QFont(st.font_family)
+        orig_font.setPixelSize(orig_px)
+        orig_font.setWeight(QFont.Weight.DemiBold)
+        fm_orig = QFontMetricsF(orig_font)
+
+        # Non-truncated balanced 2-line wrap for bilingual original text!
+        orig_lines = self._wrap_balanced_lines(orig_txt, orig_font, avail_w)[:2] if orig_txt else []
+        orig_line_step = fm_orig.height() * 1.12
+        orig_reserve_h = (len(orig_lines) * orig_line_step + 5.0) if orig_lines else 0.0
+
         prev_reserve_h = (max(13, int(st.base_font_size * 0.66)) * 1.35) if show_prev else 0.0
         main_avail_h = max(36.0, content_rect.height() - orig_reserve_h - prev_reserve_h - 14.0)
 
@@ -1356,11 +1720,13 @@ class LyricsSubtitleWindow(QWidget):
         fm_main = QFontMetricsF(main_font)
         line_step = fm_main.height() * 1.12
 
-        orig_font = QFont(st.font_family)
-        orig_font.setPixelSize(min(orig_px, max(12, int(main_font.pixelSize() * 0.64))))
-        orig_font.setWeight(QFont.Weight.DemiBold)
-        fm_orig = QFontMetricsF(orig_font)
-        elided_orig = fm_orig.elidedText(orig_txt, Qt.TextElideMode.ElideRight, avail_w) if orig_txt else ""
+        # Re-sync orig font scale if main font auto-shrunk for a very long sentence
+        scaled_orig_px = min(orig_px, max(12, int(main_font.pixelSize() * 0.64)))
+        if scaled_orig_px != orig_px:
+            orig_font.setPixelSize(scaled_orig_px)
+            fm_orig = QFontMetricsF(orig_font)
+            orig_lines = self._wrap_balanced_lines(orig_txt, orig_font, avail_w)[:2] if orig_txt else []
+            orig_line_step = fm_orig.height() * 1.12
 
         prev_font = QFont(st.font_family)
         prev_font.setPixelSize(max(13, int(main_font.pixelSize() * 0.66)))
@@ -1369,33 +1735,32 @@ class LyricsSubtitleWindow(QWidget):
         elided_prev = fm_prev.elidedText(self._prev_translated_text, Qt.TextElideMode.ElideRight, avail_w) if show_prev else ""
 
         main_block_h = len(main_lines) * line_step
-        orig_block_h = (fm_orig.height() + 5.0) if elided_orig else 0.0
+        orig_block_h = (len(orig_lines) * orig_line_step + 4.0) if orig_lines else 0.0
         prev_block_h = (fm_prev.height() + 6.0) if elided_prev else 0.0
         active_block_h = main_block_h + orig_block_h
 
-        # Bottom-anchored layout keeps 1-line and 2-line subtitles rock-steady at the exact same bottom horizon!
         if st.anchor_bottom:
             active_top = content_rect.bottom() - active_block_h - 10.0 + self._slide_offset
         else:
             active_top = content_rect.top() + max(4.0, (content_rect.height() - active_block_h) / 2.0) + self._slide_offset
 
-        prev_gap = 12.0 if st.bg_opacity > 0 else 2.0
+        eff_bg_alpha = max(int(st.bg_opacity), int(round(self._auto_bg_alpha)) if st.auto_contrast_bg else 0)
+        prev_gap = 12.0 if eff_bg_alpha > 0 else 2.0
         prev_top = active_top - prev_block_h - prev_gap
 
-        # Compute exact bounding width for snug Fit-Content capsule backdrop
         widest_active = max((fm_main.horizontalAdvance(ln) for ln in main_lines), default=0.0)
-        if elided_orig:
-            widest_active = max(widest_active, fm_orig.horizontalAdvance(elided_orig))
+        for oln in orig_lines:
+            widest_active = max(widest_active, fm_orig.horizontalAdvance(oln))
 
-        if st.bg_opacity > 0:
+        if eff_bg_alpha > 0:
             painter.save()
             painter.setOpacity(draw_op)
             bg_c = QColor(st.bg_color)
-            bg_c.setAlpha(int(st.bg_opacity))
+            bg_c.setAlpha(min(245, eff_bg_alpha))
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(bg_c)
             if st.fit_bg_to_text:
-                pill_w = min(content_rect.width(), widest_active + 44.0)
+                pill_w = min(content_rect.width(), widest_active + 46.0)
                 pill_rect = QRectF(
                     content_rect.center().x() - pill_w / 2.0,
                     active_top - 8.0,
@@ -1408,7 +1773,6 @@ class LyricsSubtitleWindow(QWidget):
                 painter.drawRoundedRect(bar_rect, float(st.bg_radius), float(st.bg_radius))
             painter.restore()
 
-        # Optional faded previous line right above active subtitle (never shifts active subtitle!)
         if elided_prev and prev_top >= content_rect.top() - 4.0:
             pw = fm_prev.horizontalAdvance(elided_prev)
             px = content_rect.center().x() - pw / 2.0
@@ -1428,47 +1792,77 @@ class LyricsSubtitleWindow(QWidget):
                 opacity=self._prev_opacity * draw_op,
             )
 
-        # Active translated lines
-        cur_y = active_top + fm_main.ascent()
-        for ln in main_lines:
-            ln_w = fm_main.horizontalAdvance(ln)
-            x = content_rect.center().x() - ln_w / 2.0
-            draw_styled_lyrics_line(
-                painter,
-                ln,
-                main_font,
-                QPointF(x, cur_y),
-                fm_main.ascent(),
-                fm_main.descent(),
-                QColor(st.color_top),
-                QColor(st.color_bottom),
-                QColor(st.stroke_color),
-                float(st.stroke_width),
-                int(st.shadow_opacity),
-                opacity=draw_op,
-            )
-            cur_y += line_step
+        hl_terms = list(self.cfg_mgr.glossary.values()) if st.highlight_glossary else None
+        # Streaming preview renders at subtle 0.88 opacity + gentle pulsing dot; final brightens cleanly to 1.0
+        active_text_op = draw_op * (0.88 if self._is_preview else 1.0)
+        orig_first = bool(orig_lines) and st.bilingual_order == "orig_top"
 
-        # Optional bilingual original text
-        if elided_orig:
-            ow = fm_orig.horizontalAdvance(elided_orig)
-            ox = content_rect.center().x() - ow / 2.0
-            oy = active_top + main_block_h + 3.0 + fm_orig.ascent()
-            orig_c = QColor(st.orig_color)
-            draw_styled_lyrics_line(
-                painter,
-                elided_orig,
-                orig_font,
-                QPointF(ox, oy),
-                fm_orig.ascent(),
-                fm_orig.descent(),
-                orig_c,
-                orig_c,
-                QColor(st.stroke_color),
-                max(1.5, float(st.stroke_width) * 0.64),
-                int(st.shadow_opacity * 0.82),
-                opacity=draw_op,
-            )
+        def _paint_orig_block(y_start: float) -> float:
+            oc = QColor(st.orig_color)
+            y_cur = y_start + fm_orig.ascent()
+            for oln in orig_lines:
+                ow = fm_orig.horizontalAdvance(oln)
+                ox = content_rect.center().x() - ow / 2.0
+                draw_styled_lyrics_line(
+                    painter,
+                    oln,
+                    orig_font,
+                    QPointF(ox, y_cur),
+                    fm_orig.ascent(),
+                    fm_orig.descent(),
+                    oc,
+                    oc,
+                    QColor(st.stroke_color),
+                    max(1.5, float(st.stroke_width) * 0.62),
+                    int(st.shadow_opacity * 0.80),
+                    opacity=active_text_op,
+                )
+                y_cur += orig_line_step
+            return y_start + orig_block_h
+
+        def _paint_main_block(y_start: float) -> float:
+            y_cur = y_start + fm_main.ascent()
+            last_end_x = content_rect.center().x()
+            last_mid_y = y_cur
+            for ln in main_lines:
+                ln_w = fm_main.horizontalAdvance(ln)
+                x = content_rect.center().x() - ln_w / 2.0
+                draw_styled_lyrics_line(
+                    painter,
+                    ln,
+                    main_font,
+                    QPointF(x, y_cur),
+                    fm_main.ascent(),
+                    fm_main.descent(),
+                    QColor(st.color_top),
+                    QColor(st.color_bottom),
+                    QColor(st.stroke_color),
+                    float(st.stroke_width),
+                    int(st.shadow_opacity),
+                    opacity=active_text_op,
+                    highlight_terms=hl_terms,
+                )
+                last_end_x = x + ln_w
+                last_mid_y = y_cur - fm_main.ascent() * 0.32
+                y_cur += line_step
+
+            # Subtle pulsing breathing dot while voice streaming preview is still speaking
+            if self._is_preview:
+                pulse = 0.45 + 0.50 * (0.5 + 0.5 * math.sin(self._preview_phase))
+                painter.save()
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(96, 165, 250, int(235 * pulse * draw_op)))
+                painter.drawEllipse(QPointF(last_end_x + 9.0, last_mid_y), 3.6, 3.6)
+                painter.restore()
+            return y_start + main_block_h + 3.0
+
+        if orig_first:
+            next_y = _paint_orig_block(active_top)
+            _paint_main_block(next_y)
+        else:
+            next_y = _paint_main_block(active_top)
+            if orig_lines:
+                _paint_orig_block(next_y)
 
 
 class _CornerBracketWidget(QWidget):

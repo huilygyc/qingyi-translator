@@ -224,6 +224,14 @@ def force_foreground_window(hwnd: int) -> None:
         pass
 
 
+def is_alt_key_pressed() -> bool:
+    """Checks whether Alt (VK_MENU) is currently held down for frictionless temporary overlay unlock."""
+    try:
+        return bool(user32.GetAsyncKeyState(0x12) & 0x8000)
+    except Exception:
+        return False
+
+
 def set_current_thread_below_normal() -> None:
     """Lowers the calling worker thread priority so background OCR never stutters video players or games."""
     try:

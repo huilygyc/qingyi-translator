@@ -10,7 +10,7 @@ import webbrowser
 from typing import Optional
 
 from PySide6.QtCore import QObject, QRect, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QIcon, QLinearGradient, QPainter, QPixmap
+from PySide6.QtGui import QAction, QColor, QGuiApplication, QIcon, QLinearGradient, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
     QApplication,
@@ -55,7 +55,14 @@ from .ui_overlays import (
     RegionSelectorOverlay,
     SnipResultCard,
 )
-from .win32_utils import GlobalHotkeyManager, force_foreground_window, grab_logical_rect_bgr
+from .win32_utils import (
+    FastWin32ScreenCapturer,
+    GlobalHotkeyManager,
+    force_foreground_window,
+    grab_logical_rect_bgr,
+    logical_rect_to_physical,
+    set_current_thread_below_normal,
+)
 
 
 def create_app_icon() -> QIcon:
@@ -101,7 +108,10 @@ class MainWindow(QMainWindow):
         self.bridge = WorkerBridge(self)
 
         self._live_screen_running = False
-        self._ocr_busy = False
+        self._screen_stop_event = threading.Event()
+        self._screen_thread: Optional[threading.Thread] = None
+        self._capture_box_lock = threading.Lock()
+        self._capture_phys_box = (0, 0, 400, 120, 0.1)
         self._force_quit = False
         self._tray_notified = False
         self._current_entry_id: str = ""
@@ -166,9 +176,6 @@ class MainWindow(QMainWindow):
         self.bridge.devices_loaded.connect(self._apply_loaded_audio_devices)
         self.bridge.empty_screen.connect(self.lyrics_win.clear_for_empty_scene)
         self.bridge.update_checked.connect(self._on_update_checked)
-
-        self.screen_timer = QTimer(self)
-        self.screen_timer.timeout.connect(self._poll_screen_region)
 
         self.hotkeys = GlobalHotkeyManager(self)
         QApplication.instance().installNativeEventFilter(self.hotkeys)
@@ -500,11 +507,16 @@ class MainWindow(QMainWindow):
         cs_left.addWidget(d1)
         cs_lay.addLayout(cs_left, 1)
 
+        self.btn_quick_bottom = QPushButton("底部字幕区")
+        self.btn_quick_bottom.setToolTip("一键锁定屏幕下方黄金字幕带（不占资源、延迟最低）")
+        self.btn_quick_bottom.clicked.connect(self._select_bottom_subtitle_band)
         self.btn_mark_region = QPushButton("框选区域")
         self.btn_mark_region.clicked.connect(lambda: self.start_region_selection("mark_region"))
         self.btn_toggle_live_screen = QPushButton("开始翻译")
         self.btn_toggle_live_screen.setObjectName("primaryBtn")
         self.btn_toggle_live_screen.clicked.connect(self.toggle_live_screen_translation)
+        cs_lay.addWidget(self.btn_quick_bottom)
+        cs_lay.addSpacing(6)
         cs_lay.addWidget(self.btn_mark_region)
         cs_lay.addSpacing(8)
         cs_lay.addWidget(self.btn_toggle_live_screen)
@@ -1091,16 +1103,38 @@ class MainWindow(QMainWindow):
         self._active_selector.raise_()
         self._active_selector.activateWindow()
 
+    def _refresh_capture_phys_box(self) -> float:
+        r = self.cfg_mgr.config.capture_region
+        rect = QRect(int(r[0]), int(r[1]), max(16, int(r[2])), max(16, int(r[3])))
+        phys_box = logical_rect_to_physical(rect)
+        with self._capture_box_lock:
+            self._capture_phys_box = phys_box
+        return phys_box[4]
+
+    def _select_bottom_subtitle_band(self) -> None:
+        scr = QGuiApplication.primaryScreen()
+        geo = scr.availableGeometry() if scr else QRect(0, 0, 1920, 1080)
+        bw = int(geo.width() * 0.76)
+        bh = int(geo.height() * 0.16)
+        bx = geo.x() + (geo.width() - bw) // 2
+        by = geo.y() + int(geo.height() * 0.79)
+        rect = QRect(bx, by, bw, bh)
+        self._on_region_selected(rect, "mark_region")
+        self._set_status("已一键锁定底部字幕带")
+
     def _on_region_selected(self, rect: QRect, mode: str) -> None:
         if mode == "mark_region":
             self.cfg_mgr.config.capture_region = [rect.x(), rect.y(), rect.width(), rect.height()]
             self.cfg_mgr.save()
             self.ocr_engine.reset_dedup()
+            area_ratio = self._refresh_capture_phys_box()
             if self.cfg_mgr.config.show_region_border:
                 self.region_indicator.set_target_rect(rect)
                 self.region_indicator.show()
             if not self._live_screen_running:
                 self.toggle_live_screen_translation()
+            elif area_ratio > 0.40:
+                self._set_status("区域较大，已启用防卡限流（建议点「底部字幕区」更快更省电）")
             else:
                 self._set_status(f"已更新区域 ({rect.width()}×{rect.height()})")
         else:
@@ -1149,44 +1183,72 @@ class MainWindow(QMainWindow):
             self.ocr_engine.reset_dedup()
             r = self.cfg_mgr.config.capture_region
             qrect = QRect(r[0], r[1], r[2], r[3])
+            area_ratio = self._refresh_capture_phys_box()
             if self.cfg_mgr.config.show_region_border:
                 self.region_indicator.set_target_rect(qrect)
                 self.region_indicator.show()
             if not self.lyrics_win.isVisible():
                 self.lyrics_win.show()
                 self.chk_sub_vis.setChecked(True)
-            self.screen_timer.start(self.cfg_mgr.config.region_interval_ms)
-            self._set_status("区域实时翻译运行中")
+            self._screen_stop_event.clear()
+            self._screen_thread = threading.Thread(
+                target=self._live_screen_worker_loop, daemon=True, name="LiveScreenWorker"
+            )
+            self._screen_thread.start()
+            if area_ratio > 0.40:
+                self._set_status("全屏监控已启用防卡限流（建议点「底部字幕区」更快更省电）")
+                self.lyrics_win.show_toast("大区域防卡模式已开启，建议框选底部字幕区提速", 2400)
+            else:
+                self._set_status("区域实时翻译运行中")
         else:
-            self.screen_timer.stop()
+            self._screen_stop_event.set()
             self.region_indicator.hide()
             self._set_status("区域翻译已停止")
         self._refresh_action_states()
 
-    def _poll_screen_region(self) -> None:
-        if self._ocr_busy or not self._live_screen_running:
-            return
-        r = self.cfg_mgr.config.capture_region
-        rect = QRect(r[0], r[1], r[2], r[3])
-        bgr = grab_logical_rect_bgr(rect)
-        if bgr is None or not self.ocr_engine.has_frame_changed(bgr):
-            return
-        self._ocr_busy = True
-        threading.Thread(target=self._process_live_frame_bg, args=(bgr,), daemon=True).start()
-
-    def _process_live_frame_bg(self, bgr) -> None:
+    def _live_screen_worker_loop(self) -> None:
+        """
+        Dedicated low-priority background capture + OCR + translation loop:
+        - Never blocks the Qt GUI thread or DWM desktop compositor.
+        - Reuses a persistent DIBSection buffer and hardware-downscales fullscreen regions.
+        - Enforces adaptive polling + post-OCR breathing cooldown on large/fullscreen selections.
+        """
+        set_current_thread_below_normal()
+        capturer = FastWin32ScreenCapturer()
         try:
-            orig = self.ocr_engine.recognize_image(bgr, self.cfg_mgr.config.target_lang)
-            if not orig:
-                empty_cnt = self.ocr_engine.record_empty_frame()
-                if empty_cnt == 3:
-                    self.bridge.empty_screen.emit()
-                return
-            if self.ocr_engine.check_is_new_subtitle(orig, stabilize=self.cfg_mgr.config.ocr_stabilize):
-                trans = self.translator.translate(orig)
-                self.bridge.subtitle_ready.emit("屏幕", orig, trans)
+            while not self._screen_stop_event.is_set() and self._live_screen_running:
+                loop_start = time.monotonic()
+                with self._capture_box_lock:
+                    px, py, pw, ph, area_ratio = self._capture_phys_box
+
+                is_fullscreen = area_ratio > 0.45
+                is_large = area_ratio > 0.30
+                base_sec = max(0.12, float(self.cfg_mgr.config.region_interval_ms) / 1000.0)
+                eff_interval = max(base_sec, 0.85) if is_fullscreen else (max(base_sec, 0.55) if is_large else base_sec)
+                diff_thresh = 6.0 if is_fullscreen else (4.2 if is_large else 3.2)
+                max_grab_side = 1024 if is_fullscreen else (1280 if is_large else 0)
+
+                bgr = capturer.grab_bgr(px, py, pw, ph, max_side=max_grab_side)
+                ran_ocr = False
+                if bgr is not None and self.ocr_engine.has_frame_changed(bgr, diff_threshold=diff_thresh):
+                    ran_ocr = True
+                    orig = self.ocr_engine.recognize_image(
+                        bgr, self.cfg_mgr.config.target_lang, large_region=is_large
+                    )
+                    if not orig:
+                        empty_cnt = self.ocr_engine.record_empty_frame()
+                        if empty_cnt == 3:
+                            self.bridge.empty_screen.emit()
+                    elif self.ocr_engine.check_is_new_subtitle(orig, stabilize=self.cfg_mgr.config.ocr_stabilize):
+                        trans = self.translator.translate(orig)
+                        self.bridge.subtitle_ready.emit("屏幕", orig, trans)
+
+                elapsed = time.monotonic() - loop_start
+                min_cooldown = (0.40 if is_fullscreen else (0.20 if is_large else 0.03)) if ran_ocr else 0.03
+                wait_sec = max(min_cooldown, eff_interval - elapsed)
+                self._screen_stop_event.wait(wait_sec)
         finally:
-            self._ocr_busy = False
+            capturer.close()
 
     # --- Audio ---
     def _apply_loaded_audio_devices(self, devs: dict) -> None:
@@ -1285,8 +1347,6 @@ class MainWindow(QMainWindow):
     def _on_interval_changed(self, val: int) -> None:
         self.cfg_mgr.config.region_interval_ms = val
         self.cfg_mgr.save()
-        if self.screen_timer.isActive():
-            self.screen_timer.setInterval(val)
 
     def _toggle_lock_overlay(self) -> None:
         cur = self.cfg_mgr.config.style.locked_click_through
@@ -1449,9 +1509,11 @@ class MainWindow(QMainWindow):
                 )
             return
 
-        self.screen_timer.stop()
+        self._live_screen_running = False
+        self._screen_stop_event.set()
         self.audio_engine.stop()
         self.lan_server.stop()
+        self.cfg_mgr.flush_pending_writes()
         self.hotkeys.unregister_all()
         self.region_indicator.close()
         self.quick_panel.close()

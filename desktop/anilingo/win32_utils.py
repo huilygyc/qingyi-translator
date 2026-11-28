@@ -224,8 +224,204 @@ def force_foreground_window(hwnd: int) -> None:
         pass
 
 
+def set_current_thread_below_normal() -> None:
+    """Lowers the calling worker thread priority so background OCR never stutters video players or games."""
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=False)
+        kernel32.GetCurrentThread.restype = wintypes.HANDLE
+        kernel32.SetThreadPriority.argtypes = [wintypes.HANDLE, ctypes.c_int]
+        kernel32.SetThreadPriority.restype = wintypes.BOOL
+        THREAD_PRIORITY_BELOW_NORMAL = -1
+        kernel32.SetThreadPriority(kernel32.GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL)
+    except Exception:
+        pass
+
+
+def logical_rect_to_physical(rect: QRect) -> Tuple[int, int, int, int, float]:
+    """
+    Converts a Qt logical QRect to physical Win32 screen pixels + area_ratio relative to its display.
+    Safe to compute cheaply on the GUI thread before passing plain ints to a background capturer.
+    """
+    screen = QGuiApplication.screenAt(rect.center()) or QGuiApplication.primaryScreen()
+    if screen is None:
+        return rect.x(), rect.y(), max(16, rect.width()), max(16, rect.height()), 0.1
+    s_geo = screen.geometry()
+    dpr = float(screen.devicePixelRatio() or 1.0)
+    # Clamp rect within screen logical bounds
+    clamped = rect.intersected(s_geo)
+    if clamped.width() < 12 or clamped.height() < 12:
+        clamped = rect
+    rel_x = clamped.x() - s_geo.x()
+    rel_y = clamped.y() - s_geo.y()
+    phys_x = int(round(s_geo.x() + rel_x * dpr))
+    phys_y = int(round(s_geo.y() + rel_y * dpr))
+    phys_w = max(16, int(round(clamped.width() * dpr)))
+    phys_h = max(16, int(round(clamped.height() * dpr)))
+    screen_area = max(1.0, float(s_geo.width() * s_geo.height()))
+    area_ratio = min(1.0, float(clamped.width() * clamped.height()) / screen_area)
+    return phys_x, phys_y, phys_w, phys_h, area_ratio
+
+
+class _BITMAPINFOHEADER(ctypes.Structure):
+    _fields_ = [
+        ("biSize", wintypes.DWORD),
+        ("biWidth", wintypes.LONG),
+        ("biHeight", wintypes.LONG),
+        ("biPlanes", wintypes.WORD),
+        ("biBitCount", wintypes.WORD),
+        ("biCompression", wintypes.DWORD),
+        ("biSizeImage", wintypes.DWORD),
+        ("biXPelsPerMeter", wintypes.LONG),
+        ("biYPelsPerMeter", wintypes.LONG),
+        ("biClrUsed", wintypes.DWORD),
+        ("biClrImportant", wintypes.DWORD),
+    ]
+
+
+class _BITMAPINFO(ctypes.Structure):
+    _fields_ = [("bmiHeader", _BITMAPINFOHEADER), ("bmiColors", wintypes.DWORD * 3)]
+
+
+class FastWin32ScreenCapturer:
+    """
+    Zero-UI-blocking, persistent-buffer Win32 GDI capturer designed for background threads.
+    - Reuses a single CreateDIBSection buffer across frames (no per-frame HBITMAP churn).
+    - Hardware/GDI-side StretchBlt downscaling when capturing huge/fullscreen regions (max_side <= 1280),
+      slashing 2.5K/4K VRAM->RAM transfer bandwidth by 4x~9x so fullscreen monitoring never lags Windows.
+    """
+
+    def __init__(self) -> None:
+        self._user32 = ctypes.WinDLL("user32", use_last_error=True)
+        self._gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+
+        self._user32.GetDC.argtypes = [wintypes.HWND]
+        self._user32.GetDC.restype = wintypes.HDC
+        self._user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
+        self._user32.ReleaseDC.restype = ctypes.c_int
+
+        self._gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
+        self._gdi32.CreateCompatibleDC.restype = wintypes.HDC
+        self._gdi32.CreateDIBSection.argtypes = [
+            wintypes.HDC,
+            ctypes.POINTER(_BITMAPINFO),
+            wintypes.UINT,
+            ctypes.POINTER(ctypes.c_void_p),
+            wintypes.HANDLE,
+            wintypes.DWORD,
+        ]
+        self._gdi32.CreateDIBSection.restype = wintypes.HBITMAP
+        self._gdi32.SelectObject.argtypes = [wintypes.HDC, wintypes.HGDIOBJ]
+        self._gdi32.SelectObject.restype = wintypes.HGDIOBJ
+        self._gdi32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
+        self._gdi32.DeleteObject.restype = wintypes.BOOL
+        self._gdi32.DeleteDC.argtypes = [wintypes.HDC]
+        self._gdi32.DeleteDC.restype = wintypes.BOOL
+        self._gdi32.SetStretchBltMode.argtypes = [wintypes.HDC, ctypes.c_int]
+        self._gdi32.SetStretchBltMode.restype = ctypes.c_int
+        self._gdi32.BitBlt.argtypes = [
+            wintypes.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            wintypes.HDC, ctypes.c_int, ctypes.c_int, wintypes.DWORD,
+        ]
+        self._gdi32.BitBlt.restype = wintypes.BOOL
+        self._gdi32.StretchBlt.argtypes = [
+            wintypes.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            wintypes.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.DWORD,
+        ]
+        self._gdi32.StretchBlt.restype = wintypes.BOOL
+
+        self._hdc_mem: int = 0
+        self._hbmp: int = 0
+        self._old_obj: int = 0
+        self._bits_ptr = ctypes.c_void_p()
+        self._buf_w: int = 0
+        self._buf_h: int = 0
+
+    def _ensure_buffer(self, hdc_scr: int, dst_w: int, dst_h: int) -> bool:
+        if self._hdc_mem and self._hbmp and self._buf_w == dst_w and self._buf_h == dst_h:
+            return True
+        self.close()
+        hdc_mem = self._gdi32.CreateCompatibleDC(hdc_scr)
+        if not hdc_mem:
+            return False
+        bmi = _BITMAPINFO()
+        bmi.bmiHeader.biSize = ctypes.sizeof(_BITMAPINFOHEADER)
+        bmi.bmiHeader.biWidth = dst_w
+        bmi.bmiHeader.biHeight = -dst_h  # top-down DIB
+        bmi.bmiHeader.biPlanes = 1
+        bmi.bmiHeader.biBitCount = 32
+        bmi.bmiHeader.biCompression = 0  # BI_RGB
+        bits_ptr = ctypes.c_void_p()
+        hbmp = self._gdi32.CreateDIBSection(hdc_mem, ctypes.byref(bmi), 0, ctypes.byref(bits_ptr), None, 0)
+        if not hbmp or not bits_ptr.value:
+            self._gdi32.DeleteDC(hdc_mem)
+            return False
+        old_obj = self._gdi32.SelectObject(hdc_mem, hbmp)
+        self._gdi32.SetStretchBltMode(hdc_mem, 3)  # COLORONCOLOR fast
+        self._hdc_mem = hdc_mem
+        self._hbmp = hbmp
+        self._old_obj = old_obj
+        self._bits_ptr = bits_ptr
+        self._buf_w = dst_w
+        self._buf_h = dst_h
+        return True
+
+    def grab_bgr(self, x: int, y: int, w: int, h: int, max_side: int = 1280) -> np.ndarray | None:
+        if w < 12 or h < 12:
+            return None
+        scale = 1.0
+        if max_side > 0 and max(w, h) > max_side:
+            scale = float(max_side) / float(max(w, h))
+        dst_w = max(16, int(round(w * scale)))
+        dst_h = max(16, int(round(h * scale)))
+
+        hdc_scr = self._user32.GetDC(None)
+        if not hdc_scr:
+            return None
+        try:
+            if not self._ensure_buffer(hdc_scr, dst_w, dst_h):
+                return None
+            SRCCOPY = 0x00CC0020
+            if dst_w == w and dst_h == h:
+                ok = self._gdi32.BitBlt(self._hdc_mem, 0, 0, dst_w, dst_h, hdc_scr, x, y, SRCCOPY)
+            else:
+                ok = self._gdi32.StretchBlt(self._hdc_mem, 0, 0, dst_w, dst_h, hdc_scr, x, y, w, h, SRCCOPY)
+            if not ok:
+                return None
+            nbytes = dst_w * dst_h * 4
+            raw = (ctypes.c_ubyte * nbytes).from_address(self._bits_ptr.value)
+            bgra = np.ctypeslib.as_array(raw).reshape((dst_h, dst_w, 4))
+            # Copy only the 3 BGR channels out of the reused DIB buffer
+            return bgra[:, :, :3].copy()
+        except Exception:
+            return None
+        finally:
+            self._user32.ReleaseDC(None, hdc_scr)
+
+    def close(self) -> None:
+        if self._hdc_mem:
+            if self._old_obj:
+                try:
+                    self._gdi32.SelectObject(self._hdc_mem, self._old_obj)
+                except Exception:
+                    pass
+                self._old_obj = 0
+            if self._hbmp:
+                try:
+                    self._gdi32.DeleteObject(self._hbmp)
+                except Exception:
+                    pass
+                self._hbmp = 0
+            try:
+                self._gdi32.DeleteDC(self._hdc_mem)
+            except Exception:
+                pass
+            self._hdc_mem = 0
+        self._buf_w = 0
+        self._buf_h = 0
+
+
 def grab_logical_rect_bgr(rect: QRect) -> np.ndarray | None:
-    """DPI-aware screen grab matching Qt logical coordinates 1:1 across 100%~200% Windows scaling."""
+    """DPI-aware one-shot screen grab (for Alt+Q snip), matching Qt logical coordinates 1:1."""
     if rect.width() < 10 or rect.height() < 10:
         return None
     import cv2

@@ -253,6 +253,8 @@ class ConfigManager:
             "Stark": "休塔尔克",
         }
         self.history: List[SubtitleEntry] = []
+        self._history_save_timer: threading.Timer | None = None
+        self._history_dirty: bool = False
         self.load()
 
     def load(self) -> None:
@@ -302,11 +304,35 @@ class ConfigManager:
 
     def save_history(self) -> None:
         with self._lock:
-            trimmed = self.history[-300:]
+            self._history_dirty = False
+            trimmed = list(self.history[-300:])
+        try:
             HISTORY_PATH.write_text(
                 json.dumps([asdict(x) for x in trimmed], ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
+        except Exception:
+            pass
+
+    def _schedule_history_save(self, delay_sec: float = 1.5) -> None:
+        """Debounces history.json disk writes off the UI thread so rapid updates never cause I/O stutter."""
+        with self._lock:
+            self._history_dirty = True
+            if self._history_save_timer is not None:
+                self._history_save_timer.cancel()
+            t = threading.Timer(delay_sec, self.save_history)
+            t.daemon = True
+            self._history_save_timer = t
+            t.start()
+
+    def flush_pending_writes(self) -> None:
+        with self._lock:
+            if self._history_save_timer is not None:
+                self._history_save_timer.cancel()
+                self._history_save_timer = None
+            dirty = self._history_dirty
+        if dirty:
+            self.save_history()
 
     def apply_preset(self, preset_key: str) -> None:
         with self._lock:
@@ -347,7 +373,7 @@ class ConfigManager:
             self.history.append(entry)
             if len(self.history) > 300:
                 self.history = self.history[-300:]
-            self.save_history()
+            self._schedule_history_save()
             return entry
 
     def update_history_entry(self, entry_id: str, new_original: str, new_translated: str) -> SubtitleEntry | None:

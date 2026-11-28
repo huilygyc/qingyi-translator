@@ -51,7 +51,8 @@ class ScreenOCREngine:
 
                     logging.getLogger("RapidOCR").setLevel(logging.WARNING)
                     cores = os.cpu_count() or 8
-                    intra_threads = min(6, max(2, cores // 3))
+                    # Keep ONNX thread count gentle so background OCR never starves video playback or desktop UI
+                    intra_threads = min(4, max(2, cores // 4))
                     self._ocr = RapidOCR(
                         params={
                             "Global.use_cls": False,
@@ -111,15 +112,19 @@ class ScreenOCREngine:
         self._prev_thumb = thumb
         return True
 
-    def recognize_image(self, bgr: np.ndarray, target_lang: str = "zh-CN") -> str:
+    def recognize_image(self, bgr: np.ndarray, target_lang: str = "zh-CN", large_region: bool = False) -> str:
         if bgr is None or bgr.size == 0:
             return ""
         import cv2
 
         h, w = bgr.shape[:2]
         proc = bgr
-        # Only upscale very tiny subtitle crops (< 34px tall) to preserve sub-50ms speed
-        if h < 34:
+        # For large / fullscreen regions, downscale early so PP-OCRv6 stays fast & lightweight
+        if large_region and max(w, h) > 960:
+            scale = 960.0 / float(max(w, h))
+            proc = cv2.resize(bgr, (max(32, int(w * scale)), max(32, int(h * scale))), interpolation=cv2.INTER_AREA)
+        elif h < 34:
+            # Only upscale very tiny subtitle crops (< 34px tall) to preserve sub-50ms speed
             scale = min(1.8, 42.0 / max(1, h))
             proc = cv2.resize(bgr, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_LINEAR)
 
@@ -136,10 +141,11 @@ class ScreenOCREngine:
 
         items: List[Tuple[float, float, str]] = []
         valid_scores: List[float] = []
+        min_score = 0.62 if large_region else 0.50
         for idx, txt in enumerate(txts):
             score = float(scores[idx]) if idx < len(scores) else 1.0
             clean = (txt or "").strip()
-            if not clean or score < 0.50:
+            if not clean or score < min_score:
                 continue
             valid_scores.append(score)
             if boxes is not None and idx < len(boxes):
@@ -156,7 +162,18 @@ class ScreenOCREngine:
 
         self._last_mean_score = sum(valid_scores) / max(1, len(valid_scores))
         items.sort(key=lambda it: (round(it[0] / 18.0), it[1]))
+        # On fullscreen regions with lots of cluttered UI/tabs/taskbar text, prefer the lower subtitle zone
+        if large_region and len(items) > 8:
+            proc_h = float(proc.shape[0])
+            bottom_items = [it for it in items if it[0] >= proc_h * 0.52 and it[0] <= proc_h * 0.94]
+            if bottom_items:
+                items = bottom_items[-4:]
+            else:
+                items = items[-6:]
+
         merged = self._join_subtitle_fragments([it[2] for it in items])
+        if large_region and len(merged) > 180:
+            merged = merged[:180].strip()
 
         if not re.search(r"[A-Za-z\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af\u0400-\u04ff]", merged):
             return ""

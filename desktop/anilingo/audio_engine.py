@@ -1,7 +1,8 @@
-"""Real-Time Audio Capture (WASAPI Computer Loopback + Microphone) & Speech-to-Text Engine."""
+"""Real-Time Low-Latency Streaming Audio Capture (WASAPI Loopback + Mic) & Speech-to-Text Engine."""
 
 from __future__ import annotations
 
+import ctypes
 import io
 import json
 import os
@@ -12,18 +13,31 @@ import threading
 import time
 import urllib.request
 import wave
+from collections import deque
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
 from .config import DATA_DIR, ConfigManager
+from .win32_utils import set_current_thread_below_normal
 
 SENSEVOICE_DIR_NAME = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"
 SENSEVOICE_URLS = [
     "https://ghfast.top/https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2",
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2",
 ]
+
+
+def _has_cuda_cublas_runtime() -> bool:
+    """0.3ms pre-check preventing the 2-second lazy CUDA load + crash penalty when CUDA toolkit isn't installed."""
+    for dll in ("cublas64_12.dll", "cublas64_11.dll"):
+        try:
+            ctypes.WinDLL(dll)
+            return True
+        except OSError:
+            pass
+    return False
 
 
 class AudioDeviceInfo:
@@ -41,25 +55,29 @@ class RealtimeAudioEngine:
     def __init__(
         self,
         cfg_mgr: ConfigManager,
-        on_transcript: Callable[[str, str], None],
+        on_transcript: Callable[..., None],
         on_level: Optional[Callable[[float], None]] = None,
         on_status: Optional[Callable[[str], None]] = None,
     ) -> None:
         self.cfg_mgr = cfg_mgr
-        self.on_transcript = on_transcript  # (source_tag, recognized_text)
+        self.on_transcript = on_transcript  # (source_tag, recognized_text, is_final)
         self.on_level = on_level
         self.on_status = on_status
 
         self._running = False
         self._capture_thread: Optional[threading.Thread] = None
         self._asr_thread: Optional[threading.Thread] = None
-        self._segment_queue: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=12)
+        # Tiny zero-backlog queue: (audio_16k, is_final) — stale audio is always dropped so live speech never snowballs!
+        self._segment_queue: "queue.Queue[Tuple[np.ndarray, bool]]" = queue.Queue(maxsize=2)
 
         self._whisper_model: Any = None
         self._whisper_loaded_name: str = ""
         self._whisper_device: str = "cpu"
+        self._cuda_checked: bool = False
+        self._cuda_available: bool = False
         self._sensevoice_rec: Any = None
         self._model_lock = threading.Lock()
+        self._last_preview_text: str = ""
 
     @staticmethod
     def list_devices() -> Dict[str, List[AudioDeviceInfo]]:
@@ -90,6 +108,7 @@ class RealtimeAudioEngine:
         if self._running:
             return
         self._running = True
+        self._last_preview_text = ""
         while not self._segment_queue.empty():
             try:
                 self._segment_queue.get_nowait()
@@ -100,6 +119,18 @@ class RealtimeAudioEngine:
         self._asr_thread = threading.Thread(target=self._asr_loop, daemon=True, name="AudioASR")
         self._capture_thread.start()
         self._asr_thread.start()
+        # Immediately pre-warm ASR model on start so sentence #1 has zero model-loading delay!
+        threading.Thread(target=self._warmup_asr_bg, daemon=True, name="AudioWarmup").start()
+
+    def _warmup_asr_bg(self) -> None:
+        set_current_thread_below_normal()
+        try:
+            if self.cfg_mgr.config.whisper_model.strip() == "sensevoice":
+                self._ensure_sensevoice()
+            else:
+                self._ensure_whisper(force_cpu=False)
+        except Exception:
+            pass
 
     def stop(self) -> None:
         self._running = False
@@ -161,10 +192,9 @@ class RealtimeAudioEngine:
                 return
 
             dev_idx = int(dev["index"])
-            dev_name = str(dev.get("name", "Audio"))
             sr = int(float(dev.get("defaultSampleRate", 48000)))
             channels = max(1, min(2, int(dev.get("maxInputChannels", 2))))
-            chunk_frames = max(512, int(sr * 0.08))  # 80ms chunks
+            chunk_frames = max(256, int(sr * 0.04))  # 40ms ultra-responsive chunks
 
             mode_label = "电脑系统原声" if self.cfg_mgr.config.audio_source == "loopback" else "麦克风语音"
             self._emit_status(f"正在听译{mode_label}")
@@ -181,15 +211,17 @@ class RealtimeAudioEngine:
             target_sr = 16000
             preroll_chunks: List[np.ndarray] = []
             speech_chunks: List[np.ndarray] = []
+            rms_history: deque[float] = deque(maxlen=55)  # ~2.2s rolling window for adaptive BGM noise floor
             speaking = False
             silence_sec = 0.0
             speech_sec = 0.0
+            since_preview_sec = 0.0
 
             while self._running:
                 try:
                     raw = stream.read(chunk_frames, exception_on_overflow=False)
                 except Exception:
-                    time.sleep(0.03)
+                    time.sleep(0.02)
                     continue
 
                 samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
@@ -209,40 +241,62 @@ class RealtimeAudioEngine:
                 if self.on_level:
                     self.on_level(min(1.0, rms * 14.0))
 
-                thresh = max(0.004, float(self.cfg_mgr.config.vad_energy_threshold))
+                # Adaptive noise floor: prevents continuous anime BGM / ambient mic noise from pinning VAD open for 3.8s!
+                rms_history.append(rms)
+                if len(rms_history) >= 12:
+                    sorted_rms = sorted(rms_history)
+                    noise_floor = sorted_rms[len(sorted_rms) // 5]  # 20th percentile background floor
+                else:
+                    noise_floor = 0.004
+
+                base_thresh = max(0.004, float(self.cfg_mgr.config.vad_energy_threshold))
+                # Dynamic threshold adapts gracefully to BGM while staying sensitive on quiet mics
+                enter_thresh = max(base_thresh, noise_floor * 1.95 + 0.006)
+                keep_thresh = max(base_thresh * 0.85, noise_floor * 1.45 + 0.004)
                 chunk_dur = len(samples_16k) / float(target_sr)
 
-                if rms >= thresh:
+                is_voiced = rms >= (keep_thresh if speaking else enter_thresh)
+                if is_voiced:
                     if not speaking:
                         speaking = True
                         speech_chunks = list(preroll_chunks)
                         speech_sec = sum(len(c) for c in speech_chunks) / float(target_sr)
+                        since_preview_sec = 0.0
                     speech_chunks.append(samples_16k)
                     speech_sec += chunk_dur
+                    since_preview_sec += chunk_dur
                     silence_sec = 0.0
+
+                    # Live streaming interim preview every ~0.85s while speaker is still talking!
+                    if speech_sec >= 0.90 and since_preview_sec >= 0.85 and self._segment_queue.empty():
+                        self._flush_segment(speech_chunks, speech_sec, is_final=False)
+                        since_preview_sec = 0.0
                 else:
                     if speaking:
                         speech_chunks.append(samples_16k)
                         speech_sec += chunk_dur
                         silence_sec += chunk_dur
-                        if silence_sec >= 0.32:
-                            self._flush_segment(speech_chunks, speech_sec)
+                        # Crisp 0.24s pause finalizes sentence immediately
+                        if silence_sec >= 0.24:
+                            self._flush_segment(speech_chunks, speech_sec, is_final=True)
                             speech_chunks = []
                             speaking = False
                             silence_sec = 0.0
                             speech_sec = 0.0
+                            since_preview_sec = 0.0
                     else:
                         preroll_chunks.append(samples_16k)
-                        if len(preroll_chunks) > 4:
+                        if len(preroll_chunks) > 5:  # ~200ms pre-roll
                             preroll_chunks.pop(0)
 
-                # Cap continuous rapid anime dialogue at 3.8s so subtitles appear promptly
-                if speaking and speech_sec >= 3.8:
-                    self._flush_segment(speech_chunks, speech_sec)
-                    speech_chunks = []
-                    speaking = False
+                # Tight 2.4s hard cap (carrying 0.2s overlap tail) so nonstop rapid anime dialogue stays super responsive
+                if speaking and speech_sec >= 2.4:
+                    self._flush_segment(speech_chunks, speech_sec, is_final=True)
+                    overlap_tail = speech_chunks[-5:] if len(speech_chunks) > 5 else []
+                    speech_chunks = list(overlap_tail)
+                    speech_sec = sum(len(c) for c in speech_chunks) / float(target_sr)
                     silence_sec = 0.0
-                    speech_sec = 0.0
+                    since_preview_sec = 0.0
 
         except Exception as exc:
             self._emit_status(f"音频捕获异常: {exc}")
@@ -256,17 +310,20 @@ class RealtimeAudioEngine:
                     pass
             p.terminate()
 
-    def _flush_segment(self, chunks: List[np.ndarray], dur_sec: float) -> None:
-        if dur_sec < 0.35 or not chunks:
+    def _flush_segment(self, chunks: List[np.ndarray], dur_sec: float, is_final: bool = True) -> None:
+        if dur_sec < 0.30 or not chunks:
             return
         seg = np.concatenate(chunks).astype(np.float32)
+        if not is_final and not self._segment_queue.empty():
+            # Never queue an interim preview behind pending work
+            return
         if self._segment_queue.full():
             try:
                 self._segment_queue.get_nowait()
             except queue.Empty:
                 pass
         try:
-            self._segment_queue.put_nowait(seg)
+            self._segment_queue.put_nowait((seg, is_final))
         except queue.Full:
             pass
 
@@ -283,8 +340,12 @@ class RealtimeAudioEngine:
             ):
                 return self._whisper_model
 
+            if not self._cuda_checked:
+                self._cuda_available = _has_cuda_cublas_runtime()
+                self._cuda_checked = True
+
             self._emit_status(f"正在加载语音模型 ({model_name})...")
-            if not force_cpu:
+            if not force_cpu and self._cuda_available:
                 try:
                     self._whisper_model = WhisperModel(model_name, device="cuda", compute_type="float16")
                     self._whisper_loaded_name = model_name
@@ -292,27 +353,41 @@ class RealtimeAudioEngine:
                     self._emit_status(f"语音引擎已就绪 (GPU · {model_name})")
                     return self._whisper_model
                 except Exception:
-                    pass
+                    self._cuda_available = False
 
-            self._whisper_model = WhisperModel(model_name, device="cpu", compute_type="int8", cpu_threads=4)
+            cores = os.cpu_count() or 8
+            cpu_threads = min(6, max(4, cores // 2))
+            self._whisper_model = WhisperModel(model_name, device="cpu", compute_type="int8", cpu_threads=cpu_threads)
             self._whisper_loaded_name = model_name
             self._whisper_device = "cpu"
             self._emit_status(f"语音引擎已就绪 ({model_name})")
             return self._whisper_model
 
     def _asr_loop(self) -> None:
+        set_current_thread_below_normal()
         while self._running:
             try:
-                audio_16k = self._segment_queue.get(timeout=0.3)
+                audio_16k, is_final = self._segment_queue.get(timeout=0.25)
             except queue.Empty:
                 continue
+
+            # Zero-backlog drain: if a newer segment already arrived, jump straight to it (never lag seconds behind!)
+            while True:
+                try:
+                    newer_audio, newer_final = self._segment_queue.get_nowait()
+                    if is_final and not newer_final:
+                        # Don't let a speculative preview discard an already-completed final sentence
+                        continue
+                    audio_16k, is_final = newer_audio, newer_final
+                except queue.Empty:
+                    break
 
             cfg = self.cfg_mgr.config
             source_tag = "audio_pc" if cfg.audio_source == "loopback" else "audio_mic"
             lang_hint = None if cfg.source_lang == "auto" else cfg.source_lang
 
             text = ""
-            if cfg.asr_cloud_api_base.strip() and cfg.asr_cloud_api_key.strip():
+            if is_final and cfg.asr_cloud_api_base.strip() and cfg.asr_cloud_api_key.strip():
                 try:
                     text = self._transcribe_cloud(audio_16k, lang_hint)
                 except Exception:
@@ -323,7 +398,10 @@ class RealtimeAudioEngine:
 
             clean = (text or "").strip()
             if clean and not self._is_hallucination(clean):
-                self.on_transcript(source_tag, clean)
+                if not is_final and clean == self._last_preview_text:
+                    continue
+                self._last_preview_text = "" if is_final else clean
+                self.on_transcript(source_tag, clean, is_final)
 
     def _ensure_sensevoice(self) -> Any:
         """Loads SenseVoiceSmall (int8 ONNX via sherpa-onnx), auto-downloading once if absent."""
@@ -391,27 +469,26 @@ class RealtimeAudioEngine:
             except Exception as exc:
                 self._emit_status(f"{exc}")
 
+        whisper_kwargs = dict(
+            language=lang_hint,
+            beam_size=1,
+            best_of=1,
+            temperature=0.0,
+            without_timestamps=True,
+            vad_filter=True,
+            vad_parameters={"min_silence_duration_ms": 200, "speech_pad_ms": 100},
+            condition_on_previous_text=False,
+        )
         try:
             model = self._ensure_whisper(force_cpu=False)
-            segments, _ = model.transcribe(
-                audio_16k,
-                language=lang_hint,
-                beam_size=1,
-                vad_filter=True,
-                condition_on_previous_text=False,
-            )
+            segments, _ = model.transcribe(audio_16k, **whisper_kwargs)
             return " ".join(s.text.strip() for s in segments if s.text.strip()).strip()
         except Exception:
-            # Automatic fallback to CPU int8 if CUDA DLLs (e.g. cublas64_12.dll) fail lazily at inference time
+            # Automatic fallback to CPU int8 if CUDA fails at inference time
+            self._cuda_available = False
             try:
                 model = self._ensure_whisper(force_cpu=True)
-                segments, _ = model.transcribe(
-                    audio_16k,
-                    language=lang_hint,
-                    beam_size=1,
-                    vad_filter=True,
-                    condition_on_previous_text=False,
-                )
+                segments, _ = model.transcribe(audio_16k, **whisper_kwargs)
                 return " ".join(s.text.strip() for s in segments if s.text.strip()).strip()
             except Exception as exc:
                 self._emit_status(f"语音识别错误: {exc}")

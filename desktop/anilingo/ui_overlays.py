@@ -927,12 +927,24 @@ class LyricsSubtitleWindow(QWidget):
             self.show_toast("已恢复实时更新", 1200)
         self.update()
 
-    def set_subtitle(self, original: str, translated: str, force: bool = False) -> None:
+    def set_subtitle(self, original: str, translated: str, force: bool = False, is_preview: bool = False) -> None:
         if self._frozen and not force:
             return
         new_orig = (original or "").strip()
         new_trans = (translated or "").strip()
         if not new_trans:
+            return
+
+        if is_preview:
+            # Smooth in-place streaming update while speaker is still talking (zero slide bounce, no history pollution)
+            self._original_text = new_orig
+            self._translated_text = new_trans
+            self._auto_hidden = False
+            self._cur_opacity = 1.0
+            self._target_opacity = 1.0
+            self._slide_offset = 0.0
+            self._restart_auto_hide_timer()
+            self.update()
             return
 
         old_trans = self._translated_text

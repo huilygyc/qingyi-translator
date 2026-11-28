@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import threading
 import time
@@ -88,6 +89,7 @@ def create_app_icon() -> QIcon:
 
 class WorkerBridge(QObject):
     subtitle_ready = Signal(str, str, str)
+    audio_preview_ready = Signal(str, str)
     snip_ready = Signal(QRect, str, str)
     snip_retranslated = Signal(str)
     audio_level = Signal(float)
@@ -112,6 +114,9 @@ class MainWindow(QMainWindow):
         self._screen_thread: Optional[threading.Thread] = None
         self._capture_box_lock = threading.Lock()
         self._capture_phys_box = (0, 0, 400, 120, 0.1)
+        self._audio_trans_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="AudioTrans")
+        self._audio_seq_lock = threading.Lock()
+        self._audio_seq = 0
         self._force_quit = False
         self._tray_notified = False
         self._current_entry_id: str = ""
@@ -169,6 +174,7 @@ class MainWindow(QMainWindow):
         )
 
         self.bridge.subtitle_ready.connect(self._on_subtitle_ready)
+        self.bridge.audio_preview_ready.connect(self._on_audio_preview_ready)
         self.bridge.snip_ready.connect(self._on_snip_ready)
         self.bridge.snip_retranslated.connect(self._on_snip_retranslated)
         self.bridge.audio_level.connect(self._update_audio_meter)
@@ -1272,10 +1278,29 @@ class MainWindow(QMainWindow):
             self.audio_engine.start()
         self._refresh_action_states()
 
-    def _on_audio_transcript_bg(self, source_tag: str, recognized_text: str) -> None:
-        trans = self.translator.translate(recognized_text)
-        label = "电脑原声" if source_tag == "audio_pc" else "麦克风"
-        self.bridge.subtitle_ready.emit(label, recognized_text, trans)
+    def _on_audio_transcript_bg(self, source_tag: str, recognized_text: str, is_final: bool = True) -> None:
+        """Runs translation concurrently in a worker pool so _asr_loop NEVER stalls waiting on HTTP translation."""
+        with self._audio_seq_lock:
+            self._audio_seq += 1
+            my_seq = self._audio_seq
+
+        def translate_task() -> None:
+            trans = self.translator.translate(recognized_text)
+            if not trans:
+                return
+            with self._audio_seq_lock:
+                stale = my_seq < self._audio_seq
+            if is_final:
+                label = "电脑原声" if source_tag == "audio_pc" else "麦克风"
+                self.bridge.subtitle_ready.emit(label, recognized_text, trans)
+            elif not stale:
+                self.bridge.audio_preview_ready.emit(recognized_text, trans)
+
+        self._audio_trans_pool.submit(translate_task)
+
+    def _on_audio_preview_ready(self, orig: str, trans: str) -> None:
+        self.lyrics_win.set_subtitle(orig, trans, is_preview=True)
+        self._set_status(f"实时听译中：{trans[:22]}")
 
     def _update_audio_meter(self, level: float) -> None:
         self.audio_meter.setValue(int(min(100, max(0, round(level * 100)))))
